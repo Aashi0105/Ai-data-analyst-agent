@@ -1,0 +1,75 @@
+# Environment variables & secrets
+.env
+*.env
+
+# Python virtual environment
+venv/
+env/
+ENV/
+.venv/
+
+# Python cache & bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Distribution / packaging
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Testing & Coverage
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+
+# IDE / Editor folders
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS generated files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Streamlit local runtime settings
+.streamlit/secrets.toml
+
+# Logs
+*.log
+logs/
+
+# Node (in case front-end tools are added)
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Model weights & large datasets
+*.pt
+*.pth
+*.bin
+*.onnx
+*.h5
+*.pkl
+*.parquet
+*.sqlite3
+*.db
