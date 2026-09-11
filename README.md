@@ -122,9 +122,8 @@ The application will launch in your browser at `http://localhost:8501`.
    - *"What is the average transaction value by payment method?"*
 4. **Inspect & Audit:** View the calculated metrics, tabular outputs, and generated charts. Expand **"View Executed Pandas Code"** to see the exact code executed.
 
-> *[Add a screenshot / demo GIF of the Streamlit dashboard here]*
 
----
+
 
 ## 📁 Project Structure
 
