@@ -20,6 +20,13 @@ def client():
     return TestClient(app)
 
 
+@pytest.fixture(autouse=True)
+def mock_gemini_api_keys(monkeypatch):
+    """Set dummy Gemini API keys so API tests don't depend on a real .env key."""
+    monkeypatch.setenv("GEMINI_API_KEY", "test-key")
+    monkeypatch.setenv("GOOGLE_API_KEY", "test-key")
+
+
 def test_health_check(client):
     """Verify health check endpoint returns 200 and expected status."""
     response = client.get("/api/health")
