@@ -95,8 +95,18 @@ def clean_code(code: str) -> str:
         code_str = code_str[3:]
     if code_str.endswith("```"):
         code_str = code_str[:-3]
-        
-    return code_str.strip()
+
+    cleaned = code_str.strip()
+
+    # If the snippet is a single bare expression, normalize it to assign to 'result'
+    try:
+        parsed = ast.parse(cleaned)
+        if len(parsed.body) == 1 and isinstance(parsed.body[0], ast.Expr):
+            cleaned = f"result = {cleaned}"
+    except Exception:
+        pass
+
+    return cleaned
 
 
 def validate_code(code_str: str) -> Tuple[bool, str]:

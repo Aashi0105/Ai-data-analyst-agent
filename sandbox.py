@@ -83,10 +83,19 @@ def execute_pandas_code(code_str: str, df: pd.DataFrame) -> Tuple[bool, Any]:
         str_columns = [str(col) for col in df.columns]
         matches = difflib.get_close_matches(missing_col, str_columns, n=3, cutoff=0.6)
         if matches:
-            suggestion = f" Did you mean one of these columns: {', '.join(repr(m) for m in matches)}?"
+            suggestion = f" Did you mean one of these: {', '.join(repr(m) for m in matches)}?"
         else:
             suggestion = ""
-        return False, f"Column '{missing_col}' was not found in the dataset.{suggestion}"
+        avail_preview = ", ".join(repr(c) for c in str_columns[:8])
+        if len(str_columns) > 8:
+            avail_preview += f", ... ({len(str_columns)} total)"
+        return False, f"Column '{missing_col}' was not found in the dataset.{suggestion} Available columns are: [{avail_preview}]."
+
+    except NameError as ne:
+        return False, f"Undefined reference: {str(ne)}. Ensure calculations only reference the existing 'df' DataFrame."
+
+    except IndexError as ie:
+        return False, f"Index out of range: {str(ie)}. Verify that filtering or indexing did not result in an empty dataset."
 
     except AttributeError as ae:
         return False, f"Data operation error: {str(ae)}"
