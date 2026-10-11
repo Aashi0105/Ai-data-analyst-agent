@@ -1,210 +1,69 @@
 # 📊 AI Data Analyst Agent
 
-**AI Data Analyst Agent** is an exploratory data analysis system that translates conversational natural language queries into executable Pandas operations, safely evaluates them inside an AST-validated and namespace-restricted Python sandbox, and returns calculated results alongside automated data visualizations.
+> **Turn raw tabular datasets into actionable business insights, statistics, and visualizations using conversational plain English.**
 
 ---
 
-## 📺 Demo
+## 📌 Overview
 
-> *[Demo placeholder: Video/GIF walkthrough will be added once frontend recordings are produced. See usage instructions below to run locally.]*
-
----
-
-## ✨ Key Features
-
-- **Automated Dataset Profiling:** Generates summary metadata upon upload (row/column counts, missing values, duplicates, and column schema types).
-- **Natural Language to Pandas:** Translates analytical business queries into targeted Pandas queries using Google Gemini (`gemini-2.5-flash`).
-- **AST-Based Static Code Validation:** Parses generated Python code into an Abstract Syntax Tree (`ast.walk`) to enforce strict structural allowlists and deny dangerous identifiers before execution.
-- **Isolated Execution Sandbox:** Executes validated Pandas code in an isolated execution namespace with safe built-ins on a deep-copied DataFrame.
-- **Fuzzy Error Recovery:** Intercepts `KeyError` exceptions and provides column suggestions via string similarity (`difflib`) alongside an overview of available dataset columns.
-- **Deterministic Auto-Visualization:** Automatically detects appropriate chart types (Bar, Scatter, Line, Histogram) based on the dimensionality and types of the execution output.
-- **Dual-Mode Benchmark Architecture:** Evaluates system accuracy and safety using both automated deterministic pipeline evaluation (43 test cases) and live LLM evaluation.
+Traditional exploratory data analysis requires writing boilerplate Pandas transformations, handling missing data, and manually assembling plotting scripts. **AI Data Analyst Agent** bridges this gap by letting users upload any CSV dataset and query it conversationally. Powered by Google Gemini (`gemini-2.5-flash`), the system profiles the data, generates precise Pandas queries, runs them inside an isolated and AST-validated execution sandbox, and renders interactive metrics and publication-ready charts on the fly.
 
 ---
 
-## 🏗️ Architecture & System Workflow
+## ✨ Features
 
-```
-User Question
-     ↓
-Dataset / Schema Context (Shape, dtypes, 3-row sample preview)
-     ↓
-Gemini (gemini-2.5-flash, temperature=0.1)
-     ↓
-Generated Pandas Code
-     ↓
-AST Validation (validator.py — structural allowlist & identifier denylist)
-     ↓
-Restricted Sandbox (sandbox.py — SAFE_BUILTINS, isolated scope, deep copy)
-     ↓
-Result Output (Scalar, Series, or DataFrame)
-     ↓
-Visualization & Presentation (charts.py heuristics + Streamlit dashboard)
+- **⚡ Automated Dataset Profiling:** Instantly inspect high-level KPIs upon upload—including total rows, columns, null value counts, duplicate rows, data types, and a 10-row interactive data preview.
+- **💬 Natural Language Querying:** Ask complex data questions in conversational English (e.g., *"Which 5 product categories generated the highest profit margin?"*).
+- **🧠 Context-Grounded Code Generation:** Uses the modern Google GenAI SDK (`google-genai`) with schema-aware prompt engineering to generate targeted Python/Pandas operations without hallucinating external schemas.
+- **🛡️ AST-Based Static Code Validation:** Parses LLM code into Python's Abstract Syntax Tree (`ast.walk`) to enforce a strict whitelist—blocking arbitrary imports, system calls, loops, functions, and dunder methods before execution.
+- **🔒 Isolated Runtime Sandbox:** Runs Pandas code within a restricted global/local execution scope using deep-copied DataFrames, protecting dataset state and preventing in-memory mutations.
+- **🔍 Fuzzy Error Recovery:** Automatically catches `KeyError` exceptions and uses string similarity heuristics (`difflib`) to suggest existing columns when typos occur.
+- **📈 Deterministic Auto-Visualization:** Automatically infers the optimal chart type (Bar Charts, Histograms, Scatter Plots, or Time-Series Line Charts) based on output data types and dimensions.
+- **💻 Transparent Code Inspection:** Displays the generated, validated Python code alongside results with execution status badges for full auditability.
+
+---
+
+## 🏗️ Architecture & How It Works
+
+```mermaid
+flowchart TD
+    A[User Uploads CSV] --> B[utils.py: Profiling & Schema Extraction]
+    B --> C[app.py: Streamlit Dashboard Rendered]
+    C --> D[User Submits Natural Language Query]
+    D --> E[prompt.py: Builds Token-Optimized Context Prompt]
+    E --> F[agent.py: Gemini 2.5 Flash Generates Pandas Code]
+    F --> G{validator.py: AST Static Safety Check}
+    G -- Violation Detected --> H[Display Specific Safety Error & Reject]
+    G -- Valid --> I[sandbox.py: Restricted Execution on Deep Copy]
+    I -- KeyError --> J[Fuzzy Column Suggestion Engine]
+    I -- Success --> K[charts.py: Deterministic Chart Heuristic]
+    K --> L[app.py: Render Tables, Metrics & Matplotlib Visuals]
 ```
 
----
-
-## 🛡️ Security Architecture
-
-Executing dynamically generated code presents inherent Remote Code Execution (RCE) risks. The agent enforces a layered defense-in-depth model:
-
-1. **AST Structural Allowlist (`validator.py`):**
-   - Parses code strictly via Python's native `ast` module.
-   - Only permitted syntax nodes (`ALLOWED_NODE_TYPES`) are accepted: expressions, assignments, subscripts, attributes, calls, arithmetic, and boolean operators.
-   - Explicitly rejects imports (`ast.Import`, `ast.ImportFrom`), function definitions (`ast.FunctionDef`), class declarations (`ast.ClassDef`), loops (`ast.For`, `ast.While`), context managers (`ast.With`), exception handlers (`ast.Try`), and generators (`ast.Yield`).
-2. **Forbidden Identifiers & Modules:**
-   - Blocks dangerous built-ins and OS interfaces: `os`, `sys`, `subprocess`, `open`, `eval`, `exec`, `__import__`, `compile`, `globals`, `locals`, `vars`, `input`, `socket`, `shutil`, `pathlib`, `pickle`, `requests`, `urllib`.
-3. **Dunder & Private Attribute Protection:**
-   - Blocks any attribute starting with `__` (preventing Python class hierarchy traversal such as `__class__`, `__bases__`, `__subclasses__`).
-4. **Namespace Isolation & Safe Built-ins (`sandbox.py`):**
-   - Execution runs inside an isolated namespace where `__builtins__` is restricted to 21 safe primitives (`len`, `range`, `abs`, `sum`, `min`, `max`, `float`, `int`, `str`, `list`, `dict`, `tuple`, `set`, etc.).
-   - Access to arbitrary Python modules, filesystems, and network sockets is absent.
-5. **Dataset Immutability:**
-   - Evaluated code operates exclusively on a deep copy (`df.copy(deep=True)`), preventing in-memory mutations to the loaded dataset.
-
-> **Security Notice:** This architecture provides a restricted in-process Python execution scope. While strict AST validation and namespace restrictions prevent common RCE and filesystem/network access, it is not a virtualized OS or container sandbox. For multi-tenant production hosting, containerized micro-isolation (e.g., gVisor, Docker containers) should be layered on top.
+### The Pipeline in Detail:
+1. **Upload & Profiling (`utils.py`):** Loads the dataset with automated fallback encoding (`utf-8`, `latin-1`, `cp1252`) and computes dimensions, missing values, and column schema.
+2. **Context Formulation (`prompt.py`):** Crafts a minimal token footprint prompt containing dataset shape, dtypes, and truncated sample records (first 3 rows).
+3. **Model Orchestration (`agent.py`):** Passes the grounded context to Google Gemini (`gemini-2.5-flash`) at low temperature (`0.1`) to ensure deterministic Python code output.
+4. **AST Code Validation (`validator.py`):** Inspects the parsed AST structure against `ALLOWED_NODE_TYPES`, rejecting imports, loops, function definitions, dunder attributes (`__`), and requiring exactly one assignment to `result`.
+5. **Sandboxed Execution (`sandbox.py`):** Executes validated code within an environment limited to 21 safe built-ins, `pd`, and `np` on a deep copy of the DataFrame.
+6. **Heuristic Charting (`charts.py`):** Analyzes the dimensions and types of `result` (e.g. 1 datetime + 1 numeric = Line Chart; 1 categorical + 1 numeric = Bar Chart) and renders a stylized Matplotlib figure.
+7. **Interactive Presentation (`app.py`):** Streamlit presents the response as scalar metric cards, interactive DataFrames, JSON, or charts, with an expandable drawer to inspect the underlying code.
 
 ---
 
-## 🔬 Benchmark Methodology
+## 💻 Tech Stack
 
-The benchmark suite (`evaluation/eval_cases.json`) comprises **43 curated test cases** evaluated against a dedicated synthetic benchmark dataset (`data/ecommerce_sales.csv`, 100 rows, 13 columns).
-
-### Test Categories (43 Total Cases):
-- **Basic Analysis (5 cases):** High-level scalar metrics (average revenue, median revenue, order counts, unique customers, total quantity).
-- **Filtering (5 cases):** Conditional queries (top region by revenue, category order counts, price thresholds, discount rates).
-- **Grouping (5 cases):** Multi-dimensional group-by aggregations (average revenue by region, order distribution, category revenue).
-- **Aggregation (5 cases):** Cumulative financial totals, profit margins, max order revenue, average ratings, and discounts.
-- **Ranking (5 cases):** Top-N entity ordering (top 5 products by revenue, top 3 customers, most frequent items).
-- **Time-based Analysis (5 cases):** Chronological operations (peak revenue month, Q1 totals, monthly trends, earliest order dates).
-- **Visualization (4 cases):** Chart compatibility validation (Bar Chart, Line Chart, Scatter Plot, Histogram heuristics).
-- **Edge & Error Cases (5 cases):** Resiliency to missing columns, missing values (NaN), empty filter conditions, and null counts.
-- **Security & Safety (4 cases):** Live attacks (`os.system`, `subprocess`, file `open()`, and dunder attribute inspection).
-
-### Comparison Methodology:
-- **Numerical Tolerance:** Analytical float metrics use relative and absolute tolerances (e.g., ±0.5 to ±5.0) rather than exact floating-point equality.
-- **Set & Ranking Overlap:** Groupings and rankings evaluate top-N entity overlaps and categorical sets rather than brittle exact string equality.
-- **Structured Outputs:** Dictionaries, Series, and DataFrames are evaluated by key mapping and numeric consistency.
-- **Safety Assertions:** Security test cases assert that the AST validator rejects unsafe code prior to execution.
+- **Core Language:** Python 3.10+
+- **Frontend / UI:** [Streamlit](https://streamlit.io/)
+- **LLM & Agent Reasoning:** [Google GenAI SDK](https://github.com/googleapis/python-genai) (`gemini-2.5-flash`)
+- **Data Manipulation:** [Pandas](https://pandas.pydata.org/), [NumPy](https://numpy.org/)
+- **Data Visualization:** [Matplotlib](https://matplotlib.org/)
+- **Code Security & Analysis:** Python Native `ast` (Abstract Syntax Tree), `difflib`
+- **Configuration & Environment:** `python-dotenv`
 
 ---
 
-## 📊 Evaluation Results
-
-The evaluation system separates **Deterministic Pipeline Evaluation** from **Live LLM Evaluation** to prevent quota exhaustion while guaranteeing reproducible verification.
-
-### 1. Deterministic Pipeline Evaluation (43 Cases)
-
-Evaluates the AST validator, restricted sandbox, error handling, auto-charting, and correctness logic without calling external LLM APIs.
-
-```text
-                      AI DATA ANALYST
-           DETERMINISTIC PIPELINE EVALUATION REPORT
-----------------------------------------------------------------------
-Total Benchmark Cases: 43
-Execution Succeeded:   37/39 executable cases (94.9%)
-Analytical Accuracy:   43/43 cases passed criteria (100.0%)
-Security Rejection:    4/4 unsafe cases blocked (100.0%)
-Average Latency:       0.002 seconds
-
-Category Breakdown:
-  Basic Analysis           | 5/5   | 100.0%
-  Filtering                | 5/5   | 100.0%
-  Grouping                 | 5/5   | 100.0%
-  Aggregation              | 5/5   | 100.0%
-  Ranking                  | 5/5   | 100.0%
-  Time-based Analysis      | 5/5   | 100.0%
-  Visualization            | 4/4   | 100.0%
-  Edge & Error Cases       | 5/5   | 100.0%
-  Security & Safety        | 4/4   | 100.0%
-```
-*(Note: 2 edge cases intentionally test missing columns; their expected `KeyError` diagnostic is verified under the graceful error handling rule).*
-
-### 2. Live LLM Evaluation (Gemini 2.5 Flash)
-
-Evaluates real end-to-end LLM code generation, AST parsing, and sandboxed execution:
-
-```text
-                      AI DATA ANALYST
-                    LIVE LLM EVALUATION
-----------------------------------------------------------------------
-Completed Run (Basic Analysis Category):
-  Total Attempted:     5
-  Execution Succeeded: 5/5 (100.0%)
-  Analytical Accuracy: 5/5 (100.0%)
-  Average Latency:     1.35 seconds
-```
-
-> **API Quota Limitation Notice:** Live end-to-end evaluation is constrained by Google AI Studio's Free Tier quotas (5 requests per minute and 20 requests per day for `gemini-2.5-flash`). The live benchmark was verified on completed sets, while full-pipeline regression testing is supported quota-free via the deterministic runner.
-
----
-
-## 🧪 Automated Testing
-
-The project includes an automated test suite executed via `pytest`:
-
-```bash
-pytest
-```
-
-**Test Results:**
-```text
-46 passed in 1.69s
-```
-
-### Coverage:
-- **Security & AST Validation (`tests/test_validator.py` - 30 tests):**
-  - Confirms rejection of `os.system`, `subprocess`, `open()`, `eval()`, `exec()`, `__import__`, `globals()`, `locals()`, network libraries (`requests`, `socket`, `urllib`), dunder attributes (`__class__`), while/for loops, functions, classes, and try/except blocks.
-  - Confirms permission of valid Pandas operations: boolean filtering, `groupby`, aggregations, `sort_values`, `nlargest`, `value_counts`, `.str` accessors, and markdown code fence stripping.
-- **Sandbox Namespace & Immutability (`tests/test_sandbox.py` - 9 tests):**
-  - Confirms DataFrame immutability on deep copies, isolation of global namespaces, `ZeroDivisionError` handling, and fuzzy `KeyError` column suggestions.
-- **Robustness & Edge Cases (`tests/test_robustness.py` - 7 tests):**
-  - Confirms syntax error diagnostics, missing value (NaN) handling, empty DataFrame execution, chart heuristic classification, and empty CSV loading.
-
----
-
-## 🔍 Error Handling & Diagnostics
-
-Instead of exposing raw Python tracebacks, user-facing operations produce actionable diagnostics:
-- **Missing Columns:** Returns the missing column name, fuzzy match suggestions via `difflib` when similar columns exist, and a preview of available dataset columns.
-- **Undefined References:** Informs the user when an unsupported variable name is referenced, directing operations to the provided `df` object.
-- **Syntax / AST Rejections:** Explains the exact disallowed construct (e.g., *"Import statements are not allowed"*, *"Access to forbidden identifier 'os' is not allowed"*).
-
----
-
-## 📁 Project Structure
-
-```
-AI-Data-Analyst-Agent/
-├── app.py                      # Streamlit dashboard entry point
-├── agent.py                    # Gemini API orchestration with backoff retries
-├── validator.py                # AST code safety validator & structural whitelist
-├── sandbox.py                  # Isolated runtime execution sandbox
-├── charts.py                   # Deterministic chart detection & Matplotlib generator
-├── prompt.py                   # Token-efficient system prompt & schema context
-├── utils.py                    # CSV multi-encoding ingestion & dataset profiling
-├── evaluate.py                 # CLI evaluation tool (deterministic and live modes)
-├── pytest.ini                  # Pytest configuration
-├── requirements.txt            # Project dependencies
-├── data/
-│   ├── ecommerce_sales.csv     # Synthetic evaluation benchmark dataset (100 rows)
-│   └── README.md               # Dataset documentation & synthetic status notice
-├── evaluation/
-│   ├── eval_cases.json         # 43 curated evaluation benchmark test cases
-│   ├── evaluator.py            # Dual-mode evaluation engine & metrics calculator
-│   └── results.json            # Machine-readable evaluation run output
-├── scripts/
-│   ├── create_dataset.py       # Deterministic benchmark data generator
-│   └── add_candidate_codes.py  # Benchmark candidate code configuration script
-└── tests/
-    ├── test_validator.py       # AST validation & security unit tests
-    ├── test_sandbox.py         # Sandbox namespace & immutability tests
-    └── test_robustness.py      # Pipeline edge-case & robustness tests
-```
-
----
-
-## ⚙️ Installation & Setup
+## ⚙️ Setup & Installation
 
 ### 1. Clone the Repository
 ```bash
@@ -213,12 +72,12 @@ cd Ai-data-analyst-agent
 ```
 
 ### 2. Create and Activate Virtual Environment
-- **Windows (PowerShell):**
+- **On Windows (PowerShell):**
   ```powershell
   python -m venv venv
   .\venv\Scripts\Activate.ps1
   ```
-- **macOS / Linux:**
+- **On macOS / Linux:**
   ```bash
   python3 -m venv venv
   source venv/bin/activate
@@ -230,47 +89,67 @@ pip install -r requirements.txt
 ```
 
 ### 4. Configure Environment Variables
-Copy `.env.example` to `.env` and add your Gemini API key:
+Copy the template configuration and supply your Google Gemini API key:
 ```bash
-# Windows
+# On Windows (PowerShell)
 Copy-Item .env.example .env
 
-# macOS / Linux
+# On macOS / Linux
 cp .env.example .env
 ```
-Update `.env`:
+Open `.env` in any text editor and replace the placeholder:
 ```env
-GEMINI_API_KEY=your_gemini_api_key_here
+GEMINI_API_KEY=your_actual_gemini_api_key_here
+```
+> Obtain a Gemini API key via [Google AI Studio](https://aistudio.google.com/).
+
+### 5. Launch the Web Application
+```bash
+streamlit run app.py
+```
+The application will launch in your browser at `http://localhost:8501`.
+
+---
+
+## 🎯 Usage
+
+1. **Upload Dataset:** Click **"Browse files"** in the sidebar to upload any `.csv` file.
+2. **Review Profile:** Examine dataset dimensions, null counts, duplicate rows, and column schemas in the top tabs.
+3. **Ask Questions:** In the query box, enter natural language queries such as:
+   - *"What are the top 5 highest sales regions?"*
+   - *"Show the monthly revenue trend over time"*
+   - *"Find the distribution of customer age"*
+   - *"What is the average transaction value by payment method?"*
+4. **Inspect & Audit:** View the calculated metrics, tabular outputs, and generated charts. Expand **"View Executed Pandas Code"** to see the exact code executed.
+
+
+
+
+## 📁 Project Structure
+
+```
+AI-Data-Analyst-Agent/
+├── app.py           # Streamlit web app entry point and dashboard UI rendering
+├── agent.py         # Gemini API client orchestration using the official google-genai SDK
+├── validator.py     # AST-based static code analyzer and structural safety whitelist
+├── sandbox.py       # Isolated execution sandbox with deep copying and fuzzy error recovery
+├── charts.py        # Heuristic chart detection engine and Matplotlib figure generator
+├── prompt.py        # Schema serialization and token-efficient system prompt templates
+├── utils.py         # CSV ingestion, fallback encoding, dataset profiling, and value formatting
+├── requirements.txt # Minimal production dependencies list
+├── .env.example     # Sanitized environment variable template
+├── .gitignore       # Comprehensive Git exclusion rules (secrets, venv, caches)
+└── README.md        # Comprehensive project documentation
 ```
 
 ---
 
-## 🚀 Usage
+## 🛡️ Safety & Sandboxing Architecture
 
-### 1. Run the Streamlit Application
-```bash
-streamlit run app.py
-```
-Open `http://localhost:8501` in your browser, upload any CSV, inspect dataset profiling tabs, and enter conversational queries.
+Allowing an LLM to generate and execute code dynamically presents significant Remote Code Execution (RCE) risks. This project implements a **two-phase defense model**:
 
-### 2. Run Automated Unit & Security Tests
-```bash
-pytest
-```
-
-### 3. Run Deterministic Pipeline Evaluation (43 Cases, No API Cost)
-```bash
-python evaluate.py --mode deterministic
-```
-
-### 4. Run Live LLM Evaluation (Requires Gemini API Key)
-```bash
-# Run specific category with pacing to respect API rate limits
-python evaluate.py --mode live --category "Basic"
-
-# Run with custom pacing delay (e.g., 12 seconds between calls)
-python evaluate.py --mode live --pacing 12.0
-```
+1. **Static AST Analysis (`validator.py`):** Before code reaches Python's interpreter, it is parsed into an AST. Any syntax construct outside of `ALLOWED_NODE_TYPES` (such as `ast.Import`, `ast.FunctionDef`, `ast.While`, `ast.For`, `ast.Try`) is rejected. Furthermore, all access to dangerous identifiers (`os`, `sys`, `subprocess`, `eval`, `exec`, `open`, `compile`, `globals`, `locals`) and private attributes (dunder methods like `__class__`) are blocked.
+2. **Namespace Isolation (`sandbox.py`):** The code executes inside a restricted dictionary containing only 21 verified safe built-ins (e.g., `len`, `range`, `sum`, `min`, `max`). The DataFrame is copied with `deep=True` so user datasets cannot be mutated in place.
 
 ---
 
@@ -284,24 +163,14 @@ For non-technical business users, refer to the [User Guide](docs/user-guide.md) 
 
 ---
 
-## ⚠️ Limitations
+## ⚠️ Limitations & Future Work
 
-- **API Quota Constraints:** Free-tier Google AI Studio API keys are limited to 5 requests per minute and 20 requests per day, requiring pacing during live testing.
-- **Single-Table Scope:** Operates on single uploaded CSV files per session; does not currently perform relational multi-table SQL joins across separate files.
-- **In-Memory Scale:** Designed for tabular data loaded into RAM via Pandas; not intended for multi-gigabyte distributed clusters (PySpark/Dask).
-- **Synthetic Evaluation Data:** The benchmark dataset is programmatically generated to ensure reproducible ground truth and does not represent private enterprise data.
-
----
-
-## 🔮 Realistic Future Improvements
-
-- **Response Caching:** Cache prompt/code hashes locally with SQLite to eliminate redundant API calls for duplicate queries.
-- **Multi-Table Relational Analysis:** Add support for multiple CSV uploads with automated foreign key / merge relationship resolution.
-- **Expanded Chart Catalog:** Add correlation heatmaps and boxplots to the heuristic visualization engine.
-- **Hardened Execution Isolation:** Provide optional containerized runner backends (e.g., Docker / gVisor) for multi-tenant deployment.
+- **Single-Table Scope:** Current queries operate on a single CSV file per session (multi-table SQL joins across multiple files are not yet supported).
+- **In-Memory Limits:** Optimized for standard tabular datasets loaded via Pandas into RAM; not designed for multi-gigabyte distributed big data (e.g., PySpark / Dask).
+- **Visualization Scope:** Heuristic chart detection currently maps 1- and 2-variable relationships (Bar, Scatter, Line, Histogram). Support for multi-variable faceted plots (heatmaps, boxplots) is planned.
 
 ---
 
 ## 📄 License
 
-This project is open-source and available under the [MIT License](LICENSE).
+This project is currently unlicensed. You may add an open-source license (such as [MIT](https://opensource.org/licenses/MIT)) if you intend to distribute or open-source it publicly.
