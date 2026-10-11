@@ -75,7 +75,7 @@ Before any generated Python code is allowed to run, it is inspected by a strict 
 - **File & Operating System Access:** System commands, file reading/writing (`open()`), network calls, and dangerous modules (`os`, `sys`, `subprocess`, `requests`, `socket`, `shutil`, `pathlib`, `pickle`, `urllib`).
 - **Dangerous Built-in Commands:** `eval`, `exec`, `compile`, `globals`, `locals`, `vars`, `input`, `exit`, `quit`, and `__import__`.
 - **Private/Dunder Attributes:** Any attribute starting with double underscores (`__`).
-- **Multiple Assignments:** The code must assign its final calculation to a single variable named `result`.
+- Result variable and other constructs: the generated code must put its final answer in a variable named `result` (a single bare expression is converted automatically). Also blocked: yield, await, global and nonlocal.
 
 If a user's question causes the AI to attempt any of these forbidden constructs, the system halts execution and displays: `❌ Validation Error: <explanation>`.
 
