@@ -17,7 +17,7 @@ import matplotlib.pyplot as plt
 from utils import load_csv, get_dataset_summary, format_value
 from agent import DataAnalystAgent
 from validator import clean_code, validate_code
-from sandbox import execute_pandas_code
+from sandbox import execute_pandas_code, SandboxExecutor
 from charts import generate_chart
 
 

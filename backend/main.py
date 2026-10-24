@@ -29,7 +29,7 @@ from pydantic import BaseModel, Field
 from utils import load_csv, get_dataset_summary, format_value
 from agent import DataAnalystAgent
 from validator import clean_code, validate_code
-from sandbox import execute_pandas_code
+from sandbox import execute_pandas_code, SandboxExecutor
 from backend.chart_utils import build_recharts_data
 
 # ============================================================================

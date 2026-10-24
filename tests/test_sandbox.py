@@ -5,6 +5,7 @@ Tests execution sandbox isolation, namespace restrictions,
 dataset immutability, subprocess worker IPC, timeouts, and error handling diagnostics.
 """
 
+import sys
 import os
 import json
 import tempfile
@@ -22,6 +23,11 @@ from sandbox import (
     MAX_CODE_SIZE_BYTES,
     BoundedFileWriter,
     ArrowWriteLimitExceededError,
+    SandboxExecutor,
+    WindowsJobObject,
+    MAX_CONCURRENT_WORKERS,
+    DEFAULT_QUEUE_TIMEOUT_SECONDS,
+    MAX_WORKER_MEMORY_BYTES,
 )
 from sandbox_worker import (
     _validate_result_bounds,
@@ -942,3 +948,166 @@ def test_numeric_error_envelope_remains_bounded():
             loaded = json.load(f)
         assert loaded["status"] == "error"
         assert loaded["error_type"] == "ResultTooLarge"
+
+
+# ============================================================================
+# Task 07C.1 — Unified Sandbox Executor & Windows Job Object Containment Tests
+# ============================================================================
+
+def test_sandbox_executor_singleton_and_delegation(sample_df):
+    """Verify SandboxExecutor maintains a singleton instance and execute_pandas_code delegates to it."""
+    executor1 = SandboxExecutor.get_instance()
+    executor2 = SandboxExecutor.get_instance()
+    assert executor1 is executor2
+
+    # Verify delegation returns matching result
+    ok1, res1 = executor1.execute("result = 123", sample_df)
+    ok2, res2 = execute_pandas_code("result = 123", sample_df)
+    assert ok1 is True and res1 == 123
+    assert ok2 is True and res2 == 123
+
+
+def test_sandbox_executor_concurrency_ceiling_and_overload_rejection(sample_df):
+    """
+    Verify concurrency limit is enforced and requests exceeding capacity
+    fail closed with queue saturation error after queue timeout.
+    """
+    custom_executor = SandboxExecutor(
+        max_concurrent_workers=1,
+        queue_timeout_seconds=0.1,
+    )
+
+    # Acquire the single slot to simulate saturated queue
+    slot_acquired = custom_executor._semaphore.acquire(timeout=0.5)
+    assert slot_acquired is True
+
+    try:
+        # Second execution must be rejected due to queue saturation
+        ok, err = custom_executor.execute("result = 1", sample_df)
+        assert ok is False
+        assert "queue saturated" in err.lower()
+        assert "exceeded concurrency limit of 1" in err.lower()
+    finally:
+        custom_executor._semaphore.release()
+
+    # Slot is now available; execution succeeds
+    ok, res = custom_executor.execute("result = 99", sample_df)
+    assert ok is True
+    assert res == 99
+
+
+def test_sandbox_executor_slot_released_on_failure_and_timeout(sample_df):
+    """Verify that concurrency slots are reliably released on validation errors and timeouts."""
+    executor = SandboxExecutor(max_concurrent_workers=1, queue_timeout_seconds=0.2)
+
+    # 1. Validation failure: slot must be released
+    ok, err = executor.execute("result = open('file.txt')", sample_df)
+    assert ok is False
+    assert "validation error" in err.lower()
+    # Confirm slot is still free
+    assert executor._semaphore.acquire(blocking=False) is True
+    executor._semaphore.release()
+
+    # 2. Timeout: slot must be released
+    timeout_code = "result = pd.concat([df] * 50000).merge(pd.concat([df] * 50000), on='region').shape[0]"
+    ok, err = executor.execute(timeout_code, sample_df, timeout_seconds=0.5)
+    assert ok is False
+    assert "timed out" in err.lower()
+    # Confirm slot is still free
+    assert executor._semaphore.acquire(blocking=False) is True
+    executor._semaphore.release()
+
+
+def test_sandbox_executor_concurrent_threads_execution(sample_df):
+    """Verify multiple simultaneous threads successfully execute via the shared executor without deadlocks."""
+    import concurrent.futures
+
+    executor = SandboxExecutor.get_instance()
+    queries = [
+        ("result = df['price'].sum()", 1400.0),
+        ("result = df['quantity'].max()", 10),
+        ("result = len(df)", 4),
+        ("result = df['price'].min()", 25.0),
+    ]
+
+    def run_query(code, expected):
+        ok, res = executor.execute(code, sample_df)
+        return ok, res, expected
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+        futures = [pool.submit(run_query, q[0], q[1]) for q in queries]
+        for f in concurrent.futures.as_completed(futures):
+            ok, res, expected = f.result()
+            assert ok is True
+            assert res == expected
+
+
+def test_windows_job_object_lifecycle_and_containment():
+    """Verify WindowsJobObject lifecycle, handle creation, limits, and cleanup on Windows."""
+    job = WindowsJobObject(memory_limit_bytes=256 * 1024 * 1024, max_processes=8)
+    assert job.handle is None
+
+    if sys.platform == "win32":
+        job.open()
+        assert job.handle is not None
+        job.close()
+        assert job.handle is None
+    else:
+        # On non-Windows platforms, open() gracefully no-ops
+        job.open()
+        assert job.handle is None
+        job.close()
+
+
+def test_windows_job_object_fail_closed_on_setup_failure(sample_df, monkeypatch):
+    """Verify executor fails closed and rejects execution if Windows Job Object setup fails."""
+    if sys.platform != "win32":
+        pytest.skip("Windows-specific Job Object test")
+
+    def mock_failing_open(self):
+        raise RuntimeError("Simulated Job Object setup error")
+
+    monkeypatch.setattr(WindowsJobObject, "open", mock_failing_open)
+
+    executor = SandboxExecutor(max_concurrent_workers=1, enable_job_object=True)
+    ok, err = executor.execute("result = 1", sample_df)
+    assert ok is False
+    assert "could not configure windows job object containment" in err.lower()
+
+
+def test_windows_job_object_fail_closed_on_assign_failure(sample_df, monkeypatch):
+    """Verify executor fails closed and kills process if Job Object assignment fails."""
+    if sys.platform != "win32":
+        pytest.skip("Windows-specific Job Object test")
+
+    def mock_failing_assign(self, proc):
+        raise RuntimeError("Simulated Job Object assign error")
+
+    monkeypatch.setattr(WindowsJobObject, "assign_process", mock_failing_assign)
+
+    executor = SandboxExecutor(max_concurrent_workers=1, enable_job_object=True)
+    ok, err = executor.execute("result = 1", sample_df)
+    assert ok is False
+    assert "could not assign worker to windows job object" in err.lower()
+
+
+def test_windows_job_object_disabled_fallback(sample_df):
+    """Verify executor can run via standard subprocess when enable_job_object is False."""
+    executor = SandboxExecutor(max_concurrent_workers=1, enable_job_object=False)
+    ok, res = executor.execute("result = 555", sample_df)
+    assert ok is True
+    assert res == 555
+
+
+def test_both_fastapi_and_streamlit_use_shared_executor():
+    """Verify that both FastAPI and Streamlit import and use the exact same shared executor contract."""
+    import backend.main as backend_main
+    import app as streamlit_app
+
+    # Verify identical execution function reference
+    assert backend_main.execute_pandas_code is sandbox.execute_pandas_code
+    assert streamlit_app.execute_pandas_code is sandbox.execute_pandas_code
+
+    # Verify identical SandboxExecutor class reference
+    assert backend_main.SandboxExecutor is sandbox.SandboxExecutor
+    assert streamlit_app.SandboxExecutor is sandbox.SandboxExecutor
