@@ -16,7 +16,7 @@ import argparse
 import json
 import difflib
 import datetime
-from typing import Any, Dict, Tuple
+from typing import Any, Dict, Tuple, Optional
 import pandas as pd
 import numpy as np
 import pyarrow as pa
@@ -395,7 +395,7 @@ def _write_response(
                 "scalar_value": None,
                 "series_metadata": None,
                 "error_type": "ResultTooLarge",
-                "error_message": f"JSON response size ({len(resp_encoded)} bytes) exceeds limit ({max_resp_bytes} bytes)."
+                "error_message": f"Response envelope size ({len(resp_encoded)} bytes) exceeds limit ({max_resp_bytes} bytes)."
             }
             resp_encoded = json.dumps(fallback).encode("utf-8")
 
@@ -417,12 +417,24 @@ def _write_response(
 
 
 
-def run_worker(ipc_dir: str) -> None:
+def run_worker(
+    ipc_dir: Optional[str] = None,
+    in_dir: Optional[str] = None,
+    out_dir: Optional[str] = None,
+) -> None:
     """Executes the analysis query inside the worker process."""
-    req_path = os.path.join(ipc_dir, "request.json")
-    input_arrow_path = os.path.join(ipc_dir, "input_data.arrow")
-    resp_path = os.path.join(ipc_dir, "response.json")
-    output_arrow_path = os.path.join(ipc_dir, "output_data.arrow")
+    if in_dir is None and out_dir is None:
+        if ipc_dir is None:
+            raise ValueError("Either ipc_dir or both in_dir and out_dir must be provided.")
+        in_dir = ipc_dir
+        out_dir = ipc_dir
+    elif in_dir is None or out_dir is None:
+        raise ValueError("Both in_dir and out_dir must be provided if one is specified.")
+
+    req_path = os.path.join(in_dir, "request.json")
+    input_arrow_path = os.path.join(in_dir, "input_data.arrow")
+    resp_path = os.path.join(out_dir, "response.json")
+    output_arrow_path = os.path.join(out_dir, "output_data.arrow")
 
     if not os.path.exists(req_path) or not os.path.exists(input_arrow_path):
         _write_response(resp_path, {
@@ -930,10 +942,17 @@ def run_worker(ipc_dir: str) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Isolated Python execution worker")
-    parser.add_argument("--ipc-dir", required=True, help="Directory containing IPC request and response files")
+    parser.add_argument("--ipc-dir", required=False, default=None, help="Directory containing both input and output IPC files (legacy/shared)")
+    parser.add_argument("--in-dir", required=False, default=None, help="Directory containing read-only input IPC files (request.json, input_data.arrow)")
+    parser.add_argument("--out-dir", required=False, default=None, help="Directory containing writable output IPC files (response.json, output_data.arrow)")
     args = parser.parse_args()
 
-    run_worker(args.ipc_dir)
+    if args.in_dir and args.out_dir:
+        run_worker(in_dir=args.in_dir, out_dir=args.out_dir)
+    elif args.ipc_dir:
+        run_worker(ipc_dir=args.ipc_dir)
+    else:
+        parser.error("Either --ipc-dir or both --in-dir and --out-dir must be specified.")
 
 
 if __name__ == "__main__":

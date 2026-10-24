@@ -1,0 +1,35 @@
+# Dockerfile.sandbox
+# Hardened, unprivileged container execution image for AI Data Analyst Agent
+# Used for isolated execution of AI-generated pandas analysis scripts.
+
+FROM python:3.12-slim
+
+# Prevent bytecode generation on read-only rootfs and ensure unbuffered output
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
+
+# Create unprivileged sandbox user (UID 10001, GID 10001) with no login shell
+RUN groupadd -g 10001 sandboxgroup && \
+    useradd -u 10001 -g sandboxgroup -s /sbin/nologin -M sandboxuser
+
+# Install minimal numerical analysis dependencies without caching wheels
+RUN pip install --no-cache-dir \
+    "pandas>=2.0.0" \
+    "numpy>=1.26.0" \
+    "pyarrow>=14.0.0"
+
+WORKDIR /workspace
+
+# Copy worker execution engine and safety validator
+COPY sandbox_worker.py /workspace/sandbox_worker.py
+COPY validator.py /workspace/validator.py
+
+# Ensure workspace is owned by root and readable by sandboxuser
+RUN chown -R root:root /workspace && \
+    chmod -R 755 /workspace
+
+# Default execution as unprivileged user
+USER 10001:10001
+
+# Default entrypoint runs worker with unbuffered standard I/O
+ENTRYPOINT ["python", "-u", "/workspace/sandbox_worker.py"]

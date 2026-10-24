@@ -17,6 +17,7 @@ import json
 import tempfile
 import subprocess
 import threading
+import uuid
 from pathlib import Path
 from typing import Tuple, Any, Dict, Optional, List
 import pandas as pd
@@ -53,6 +54,7 @@ MAX_CONCURRENT_WORKERS = int(os.environ.get("SANDBOX_MAX_CONCURRENT_WORKERS", "4
 DEFAULT_QUEUE_TIMEOUT_SECONDS = float(os.environ.get("SANDBOX_QUEUE_TIMEOUT_SECONDS", "5.0"))
 MAX_WORKER_MEMORY_BYTES = int(os.environ.get("SANDBOX_WORKER_MEMORY_BYTES", str(512 * 1024 * 1024)))  # 512 MiB
 MAX_WORKER_PROCESSES = int(os.environ.get("SANDBOX_WORKER_PROCESSES", "16"))
+DOCKER_SANDBOX_IMAGE = os.environ.get("SANDBOX_DOCKER_IMAGE", "ai-data-analyst-sandbox:latest")
 
 
 
@@ -730,6 +732,173 @@ def _terminate_process_tree(proc: Any, job: Optional[WindowsJobObject] = None) -
         pass
 
 
+def _is_docker_available() -> bool:
+    """
+    Checks if the Docker CLI binary exists and the Docker daemon is responding.
+    """
+    try:
+        res = subprocess.run(
+            ["docker", "version", "--format", "{{.Server.Version}}"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=2.0,
+            check=False,
+            text=True,
+        )
+        return res.returncode == 0 and bool(res.stdout.strip())
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError, Exception):
+        return False
+
+
+def _build_docker_cmd(
+    in_dir: str,
+    out_dir: str,
+    image_name: str = DOCKER_SANDBOX_IMAGE,
+    container_name: Optional[str] = None,
+    memory_limit: str = "512m",
+    cpu_limit: str = "1.0",
+    pids_limit: int = 16,
+    timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
+) -> Tuple[List[str], str]:
+    """
+    Constructs the hardened docker run command line enforcing:
+      - --network none: Complete network isolation (no internet, no LAN, no host loopback).
+      - --read-only: Read-only container root filesystem.
+      - --cap-drop ALL: All Linux capabilities dropped.
+      - --security-opt no-new-privileges:true: Prevents gaining privileges.
+      - --user 10001:10001: Unprivileged non-root user.
+      - --memory and --memory-swap: Strict memory limit with swap disabled.
+      - --cpus: CPU quota enforcement.
+      - --pids-limit: Process table limit preventing fork bombs.
+      - --tmpfs /tmp: Narrow, non-executable, bounded temporary storage.
+      - -v in_dir:/workspace/ipc/in:ro: Input files mounted strictly READ-ONLY.
+      - -v out_dir:/workspace/ipc/out:rw: Output files mounted in narrowly scoped writable directory.
+      - --stop-timeout: Container stop timeout matching execution deadline.
+      - --rm: Automatic removal on exit.
+    """
+    if not container_name:
+        container_name = f"sandbox_worker_{uuid.uuid4().hex[:16]}"
+
+    abs_in = os.path.abspath(in_dir)
+    abs_out = os.path.abspath(out_dir)
+
+    cmd = [
+        "docker",
+        "run",
+        "--rm",
+        "--name",
+        container_name,
+        "--network",
+        "none",
+        "--read-only",
+        "--cap-drop",
+        "ALL",
+        "--security-opt",
+        "no-new-privileges:true",
+        "--user",
+        "10001:10001",
+        f"--memory={memory_limit}",
+        f"--memory-swap={memory_limit}",
+        f"--cpus={cpu_limit}",
+        f"--pids-limit={pids_limit}",
+        "--tmpfs",
+        "/tmp:rw,noexec,nosuid,size=64m",
+        "-v",
+        f"{abs_in}:/workspace/ipc/in:ro",
+        "-v",
+        f"{abs_out}:/workspace/ipc/out:rw",
+        f"--stop-timeout={max(1, int(timeout_seconds))}",
+        image_name,
+        "python",
+        "-u",
+        "/workspace/sandbox_worker.py",
+        "--in-dir",
+        "/workspace/ipc/in",
+        "--out-dir",
+        "/workspace/ipc/out",
+    ]
+    return cmd, container_name
+
+
+def _kill_and_remove_docker_container(container_name: str) -> None:
+    """Best-effort termination and removal of an isolated Docker worker container."""
+    try:
+        subprocess.run(
+            ["docker", "kill", container_name],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=5.0,
+            check=False,
+        )
+    except Exception:
+        pass
+    try:
+        subprocess.run(
+            ["docker", "rm", "-f", container_name],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=5.0,
+            check=False,
+        )
+    except Exception:
+        pass
+
+
+def _validate_host_output_files(
+    out_dir: str,
+    resp_path: str,
+    output_arrow_path: str,
+    max_resp_bytes: int = MAX_RESPONSE_JSON_BYTES,
+    max_arrow_bytes: int = MAX_RESULT_ARROW_BYTES,
+    max_total_bytes: int = MAX_TOTAL_IPC_BYTES,
+) -> Tuple[bool, str]:
+    """
+    Rigorously validates output files produced by the worker before the host reads them.
+    Guarantees:
+      - Symlinks are rejected to prevent arbitrary host file reading / path traversal attacks.
+      - Non-regular files (FIFOs, device files, directories) are rejected.
+      - Individual file sizes are strictly bounded before reading into host memory.
+      - Aggregate directory storage budget is enforced.
+    """
+    if not os.path.exists(out_dir) or not os.path.isdir(out_dir):
+        return False, "Output directory does not exist or is not a directory."
+
+    if not os.path.exists(resp_path):
+        return False, "Worker did not return response envelope."
+
+    if os.path.islink(resp_path):
+        return False, "Response envelope cannot be a symbolic link."
+
+    if not os.path.isfile(resp_path):
+        return False, "Response envelope path is not a regular file."
+
+    resp_size = os.path.getsize(resp_path)
+    if resp_size > max_resp_bytes:
+        return False, f"Response envelope size ({resp_size} bytes) exceeds limit ({max_resp_bytes} bytes)."
+
+    if os.path.exists(output_arrow_path):
+        if os.path.islink(output_arrow_path):
+            return False, "Output tabular payload cannot be a symbolic link."
+        if not os.path.isfile(output_arrow_path):
+            return False, "Output tabular payload path is not a regular file."
+        arrow_size = os.path.getsize(output_arrow_path)
+        if arrow_size > max_arrow_bytes:
+            return False, f"Output tabular payload size ({arrow_size} bytes) exceeds limit ({max_arrow_bytes} bytes)."
+
+    try:
+        total_out_size = sum(
+            os.path.getsize(os.path.join(out_dir, f))
+            for f in os.listdir(out_dir)
+            if os.path.isfile(os.path.join(out_dir, f)) and not os.path.islink(os.path.join(out_dir, f))
+        )
+        if total_out_size > max_total_bytes:
+            return False, f"Total output IPC storage ({total_out_size} bytes) exceeds limit ({max_total_bytes} bytes)."
+    except OSError as e:
+        return False, f"Failed to verify output directory storage: {str(e)}"
+
+    return True, ""
+
+
 class SandboxExecutor:
     """
     Centralized execution orchestration engine for AI-generated pandas code.
@@ -742,20 +911,25 @@ class SandboxExecutor:
         and saturation rejection (Note: this coordinates execution strictly within the
         current Python host process; it does not enforce machine-wide or multi-worker limits).
       - Ephemeral Arrow IPC and JSON envelope exchange with write-time budgets.
+      - Separated IPC permissions: read-only input directory and narrowly scoped writable output directory.
       - Race-free OS-level containment:
           * On Windows: worker is created suspended (CREATE_SUSPENDED), assigned to a configured
-            Windows Job Object, and resumed only after assignment succeeds.
-          * On POSIX: isolated process groups (start_new_session=True).
-      - Hard wall-clock timeout and process-tree termination.
+            Windows Job Object with strict handle inheritance filtering, and resumed only after assignment.
+          * On Linux: dedicated, short-lived Docker container with non-root user, --network none,
+            --read-only rootfs, dropped capabilities, cgroups v2 memory/pids/cpu limits, and no-new-privileges.
+          * Fail-Closed Policy: If required isolation runtime (e.g. Docker on Linux) is unavailable,
+            execution is strictly rejected. Never falls back to unrestricted host subprocess execution.
+      - Hard wall-clock timeout and process-tree/container termination.
       - Bounded numeric, string, collection, and response serialization limits.
+      - Host-side output file validation rejecting symbolic links and size violations before reading.
       - Zero fallback to in-process execution.
 
-    Known Limitations:
-      - A disconnected HTTP client does not automatically abort synchronous execution already in progress.
-      - Windows Job Objects isolate CPU, committed memory, and process lifecycle; they do NOT
-        independently sandbox the filesystem, network stack, or kernel IPC namespaces.
-      - Not certified for public multi-tenant execution of arbitrary untrusted payloads without hypervisor
-        or container isolation.
+    Host Security Notice:
+      - The API host process communicates with the Docker daemon. To protect the host, the Docker socket
+        (/var/run/docker.sock) is NEVER mounted into worker containers. For production deployments,
+        using Rootless Docker or an API-level socket proxy with a strict endpoint allowlist is recommended.
+      - Docker isolation does not eliminate shared Linux kernel attack surfaces (e.g., kernel 0-day bugs).
+        For public multi-tenant platforms, microVMs (e.g., Firecracker) or gVisor are recommended.
     """
     _instance: Optional["SandboxExecutor"] = None
     _lock = threading.Lock()
@@ -767,12 +941,26 @@ class SandboxExecutor:
         worker_memory_limit_bytes: int = MAX_WORKER_MEMORY_BYTES,
         worker_process_limit: int = MAX_WORKER_PROCESSES,
         enable_job_object: bool = True,
+        backend: Optional[str] = None,
+        docker_image: str = DOCKER_SANDBOX_IMAGE,
     ):
         self.max_concurrent_workers = max_concurrent_workers
         self.queue_timeout_seconds = queue_timeout_seconds
         self.worker_memory_limit_bytes = worker_memory_limit_bytes
         self.worker_process_limit = worker_process_limit
         self.enable_job_object = enable_job_object
+        self.docker_image = docker_image
+
+        env_backend = os.environ.get("SANDBOX_BACKEND", "").lower().strip()
+        if backend:
+            self.backend = backend.lower().strip()
+        elif env_backend:
+            self.backend = env_backend
+        elif sys.platform == "win32":
+            self.backend = "windows"
+        else:
+            self.backend = "docker"
+
         self._semaphore = threading.BoundedSemaphore(self.max_concurrent_workers)
 
     @classmethod
@@ -850,15 +1038,20 @@ class SandboxExecutor:
         if not WORKER_SCRIPT.is_file():
             return False, f"Execution failed: Sandbox worker not found at {WORKER_SCRIPT}."
 
-        # 2. Ephemeral IPC directory setup with deterministic cleanup
+        # 2. Ephemeral IPC directory setup with deterministic cleanup and separated permissions
         try:
             with tempfile.TemporaryDirectory(prefix="agy_ipc_") as ipc_dir:
-                req_path = os.path.join(ipc_dir, "request.json")
-                input_arrow_path = os.path.join(ipc_dir, "input_data.arrow")
-                resp_path = os.path.join(ipc_dir, "response.json")
-                output_arrow_path = os.path.join(ipc_dir, "output_data.arrow")
+                in_dir = os.path.join(ipc_dir, "in")
+                out_dir = os.path.join(ipc_dir, "out")
+                os.makedirs(in_dir, exist_ok=True)
+                os.makedirs(out_dir, exist_ok=True)
 
-                # Write bounded request envelope
+                req_path = os.path.join(in_dir, "request.json")
+                input_arrow_path = os.path.join(in_dir, "input_data.arrow")
+                resp_path = os.path.join(out_dir, "response.json")
+                output_arrow_path = os.path.join(out_dir, "output_data.arrow")
+
+                # Write bounded request envelope into read-only input location
                 try:
                     req_payload = {
                         "code": code_to_run,
@@ -911,21 +1104,57 @@ class SandboxExecutor:
                             pass
                     return False, f"Execution setup failed: Unable to serialize dataset: {str(e)}"
 
-                # Pre-launch total IPC storage check
+                # Pre-launch total input storage check
                 initial_ipc_size = sum(
-                    os.path.getsize(os.path.join(ipc_dir, f))
-                    for f in os.listdir(ipc_dir)
-                    if os.path.isfile(os.path.join(ipc_dir, f))
+                    os.path.getsize(os.path.join(in_dir, f))
+                    for f in os.listdir(in_dir)
+                    if os.path.isfile(os.path.join(in_dir, f))
                 )
                 if initial_ipc_size > MAX_TOTAL_IPC_BYTES:
                     return False, f"Execution setup failed: Initial IPC storage ({initial_ipc_size // (1024*1024)} MiB) exceeds total limit ({MAX_TOTAL_IPC_BYTES // (1024*1024)} MiB)."
 
-                # 3. Spawn isolated worker subprocess with zero diagnostic memory/disk overhead
-                cmd = [sys.executable, "-u", str(WORKER_SCRIPT), "--ipc-dir", ipc_dir]
-                safe_env = _get_safe_env()
-
+                # 3. Spawn isolated worker with platform containment
                 job = None
-                if sys.platform == "win32":
+                container_name = None
+                proc = None
+
+                if self.backend == "docker":
+                    if not _is_docker_available():
+                        return False, (
+                            "Execution setup failed: Linux execution requires Docker containment, "
+                            "but Docker daemon is unreachable or docker command is not found. "
+                            "Execution rejected under fail-closed security policy."
+                        )
+                    docker_cmd, container_name = _build_docker_cmd(
+                        in_dir,
+                        out_dir,
+                        image_name=self.docker_image,
+                        timeout_seconds=timeout_seconds,
+                    )
+                    try:
+                        proc = subprocess.Popen(
+                            docker_cmd,
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL,
+                        )
+                    except Exception as e:
+                        return False, f"Execution failed: Could not launch Docker sandbox container: {str(e)}"
+
+                elif self.backend == "windows":
+                    if sys.platform != "win32":
+                        return False, "Execution setup failed: Windows Job Object backend is only supported on Windows hosts."
+                    cmd = [
+                        sys.executable,
+                        "-u",
+                        str(WORKER_SCRIPT),
+                        "--ipc-dir",
+                        ipc_dir,
+                        "--in-dir",
+                        in_dir,
+                        "--out-dir",
+                        out_dir,
+                    ]
+                    safe_env = _get_safe_env()
                     if self.enable_job_object:
                         try:
                             job = WindowsJobObject(
@@ -945,36 +1174,54 @@ class SandboxExecutor:
                             return False, f"Execution failed: {err_msg}"
                         return False, f"Execution failed: Could not launch worker process: {err_msg}"
                 else:
-                    popen_kwargs: Dict[str, Any] = {
-                        "stdout": subprocess.DEVNULL,  # Discard worker stdout at OS kernel level
-                        "stderr": subprocess.DEVNULL,  # Discard worker stderr at OS kernel level; diagnostics in response.json
-                        "env": safe_env,
-                        "start_new_session": True,
-                    }
-                    try:
-                        proc = subprocess.Popen(cmd, **popen_kwargs)
-                    except Exception as e:
-                        return False, f"Execution failed: Could not launch worker process: {str(e)}"
+                    return False, f"Execution setup failed: Unrecognized sandbox backend '{self.backend}'."
 
                 # 4. Wait for execution under hard wall-clock deadline
                 try:
                     try:
                         proc.wait(timeout=timeout_seconds)
                     except subprocess.TimeoutExpired:
-                        _terminate_process_tree(proc, job=job)
+                        if container_name:
+                            _kill_and_remove_docker_container(container_name)
+                        else:
+                            _terminate_process_tree(proc, job=job)
                         return False, f"Execution timed out after {timeout_seconds} seconds."
                     except Exception as e:
-                        _terminate_process_tree(proc, job=job)
+                        if container_name:
+                            _kill_and_remove_docker_container(container_name)
+                        else:
+                            _terminate_process_tree(proc, job=job)
                         return False, f"Execution process failure: {str(e)}"
                 finally:
+                    if container_name:
+                        _kill_and_remove_docker_container(container_name)
                     if job is not None:
                         job.close()
                     if hasattr(proc, "close"):
                         proc.close()
 
+                # Resolve output paths (handling legacy/mock test workers that write to ipc_dir or in_dir)
+                if not os.path.exists(resp_path):
+                    if os.path.exists(os.path.join(ipc_dir, "response.json")):
+                        resp_path = os.path.join(ipc_dir, "response.json")
+                        out_dir = ipc_dir
+                    elif os.path.exists(os.path.join(in_dir, "response.json")):
+                        resp_path = os.path.join(in_dir, "response.json")
+                        out_dir = in_dir
+
+                if not os.path.exists(output_arrow_path):
+                    if os.path.exists(os.path.join(ipc_dir, "output_data.arrow")):
+                        output_arrow_path = os.path.join(ipc_dir, "output_data.arrow")
+                    elif os.path.exists(os.path.join(in_dir, "output_data.arrow")):
+                        output_arrow_path = os.path.join(in_dir, "output_data.arrow")
+
                 # 5. Process exit verification and error diagnostic handling
                 if proc.returncode != 0:
-                    if os.path.exists(resp_path) and os.path.getsize(resp_path) <= MAX_RESPONSE_JSON_BYTES:
+                    if (
+                        os.path.exists(resp_path)
+                        and not os.path.islink(resp_path)
+                        and os.path.getsize(resp_path) <= MAX_RESPONSE_JSON_BYTES
+                    ):
                         try:
                             with open(resp_path, "r", encoding="utf-8") as f:
                                 data = json.load(f)
@@ -985,22 +1232,17 @@ class SandboxExecutor:
 
                     return False, f"Execution worker exited with code {proc.returncode}."
 
-                # 6. Post-execution IPC directory total size verification
-                total_ipc_size = sum(
-                    os.path.getsize(os.path.join(ipc_dir, f))
-                    for f in os.listdir(ipc_dir)
-                    if os.path.isfile(os.path.join(ipc_dir, f))
+                # 6. Rigorous host-side validation of output files before reading
+                is_valid_out, out_err = _validate_host_output_files(
+                    out_dir,
+                    resp_path,
+                    output_arrow_path,
+                    max_resp_bytes=MAX_RESPONSE_JSON_BYTES,
+                    max_arrow_bytes=MAX_RESULT_ARROW_BYTES,
+                    max_total_bytes=MAX_TOTAL_IPC_BYTES,
                 )
-                if total_ipc_size > MAX_TOTAL_IPC_BYTES:
-                    return False, f"Execution failed: Total IPC storage ({total_ipc_size // (1024*1024)} MiB) exceeds limit ({MAX_TOTAL_IPC_BYTES // (1024*1024)} MiB)."
-
-                # 7. Response envelope pre-read size check and schema validation
-                if not os.path.exists(resp_path):
-                    return False, "Execution failed: Worker did not return response envelope."
-
-                resp_file_size = os.path.getsize(resp_path)
-                if resp_file_size > MAX_RESPONSE_JSON_BYTES:
-                    return False, f"Execution failed: Response envelope size ({resp_file_size} bytes) exceeds limit ({MAX_RESPONSE_JSON_BYTES} bytes)."
+                if not is_valid_out:
+                    return False, f"Execution failed: {out_err}"
 
                 try:
                     with open(resp_path, "r", encoding="utf-8") as f:

@@ -9,6 +9,7 @@ import sys
 import os
 import json
 import tempfile
+import subprocess
 from pathlib import Path
 import io
 import pyarrow as pa
@@ -1577,3 +1578,295 @@ def test_unicode_environment_block_sorting_and_deduplication():
 
     # Verify double-null termination
     assert env_str.endswith("\0\0")
+
+
+def test_docker_command_construction_and_security_flags(tmp_path):
+    """
+    [CROSS-PLATFORM UNIT TEST]
+    Verifies that _build_docker_cmd generates all required hardening and containment flags:
+      - --network none
+      - --read-only
+      - --cap-drop ALL
+      - --security-opt no-new-privileges:true
+      - --user 10001:10001
+      - --memory=512m --memory-swap=512m
+      - --cpus=1.0
+      - --pids-limit=16
+      - --tmpfs /tmp:rw,noexec,nosuid,size=64m
+      - separate read-only input mount (-v in_dir:/workspace/ipc/in:ro)
+      - separate writable output mount (-v out_dir:/workspace/ipc/out:rw)
+      - worker invocation using --in-dir and --out-dir
+    """
+    in_dir = str(tmp_path / "in")
+    out_dir = str(tmp_path / "out")
+    os.makedirs(in_dir, exist_ok=True)
+    os.makedirs(out_dir, exist_ok=True)
+
+    cmd, container_name = sandbox._build_docker_cmd(
+        in_dir=in_dir,
+        out_dir=out_dir,
+        image_name="test-sandbox:1.0",
+        container_name="test_worker_12345",
+        memory_limit="512m",
+        cpu_limit="1.0",
+        pids_limit=16,
+        timeout_seconds=5.0,
+    )
+
+    assert cmd[0] == "docker"
+    assert cmd[1] == "run"
+    assert "--rm" in cmd
+    assert "--name" in cmd and cmd[cmd.index("--name") + 1] == "test_worker_12345"
+    assert "--network" in cmd and cmd[cmd.index("--network") + 1] == "none"
+    assert "--read-only" in cmd
+    assert "--cap-drop" in cmd and cmd[cmd.index("--cap-drop") + 1] == "ALL"
+    assert "--security-opt" in cmd and cmd[cmd.index("--security-opt") + 1] == "no-new-privileges:true"
+    assert "--user" in cmd and cmd[cmd.index("--user") + 1] == "10001:10001"
+    assert "--memory=512m" in cmd
+    assert "--memory-swap=512m" in cmd
+    assert "--cpus=1.0" in cmd
+    assert "--pids-limit=16" in cmd
+    assert "--tmpfs" in cmd and cmd[cmd.index("--tmpfs") + 1] == "/tmp:rw,noexec,nosuid,size=64m"
+
+    abs_in = os.path.abspath(in_dir)
+    abs_out = os.path.abspath(out_dir)
+    expected_in_mount = f"{abs_in}:/workspace/ipc/in:ro"
+    expected_out_mount = f"{abs_out}:/workspace/ipc/out:rw"
+    assert expected_in_mount in cmd
+    assert expected_out_mount in cmd
+
+    assert "--in-dir" in cmd and cmd[cmd.index("--in-dir") + 1] == "/workspace/ipc/in"
+    assert "--out-dir" in cmd and cmd[cmd.index("--out-dir") + 1] == "/workspace/ipc/out"
+
+
+def test_host_output_validation_rejects_symlinks(tmp_path, monkeypatch):
+    """
+    [CROSS-PLATFORM UNIT TEST]
+    Verifies that _validate_host_output_files rejects symbolic links for response.json
+    and output_data.arrow, preventing host path traversal / secret file reading.
+    Uses real symlink when supported by OS privileges, and verified islink mock on unprivileged Windows.
+    """
+    out_dir = str(tmp_path / "out")
+    os.makedirs(out_dir, exist_ok=True)
+
+    secret_file = tmp_path / "secret.txt"
+    secret_file.write_text("HOST_SECRET_TOKEN")
+
+    resp_path = os.path.join(out_dir, "response.json")
+    arrow_path = os.path.join(out_dir, "output_data.arrow")
+
+    try:
+        os.symlink(str(secret_file), resp_path)
+        real_symlink = True
+    except (OSError, NotImplementedError):
+        real_symlink = False
+        with open(resp_path, "w") as f:
+            f.write("{}")
+        monkeypatch.setattr(os.path, "islink", lambda p: p == resp_path)
+
+    is_valid, err_msg = sandbox._validate_host_output_files(out_dir, resp_path, arrow_path)
+    assert not is_valid
+    assert "symbolic link" in err_msg.lower()
+
+    if real_symlink:
+        os.remove(resp_path)
+    # Write regular response.json
+    with open(resp_path, "w") as f:
+        f.write('{"status": "success"}')
+
+    # Now test output_data.arrow symlink rejection
+    if real_symlink:
+        os.symlink(str(secret_file), arrow_path)
+    else:
+        with open(arrow_path, "wb") as f:
+            f.write(b"arrow")
+        monkeypatch.setattr(os.path, "islink", lambda p: p == arrow_path)
+
+    is_valid, err_msg = sandbox._validate_host_output_files(out_dir, resp_path, arrow_path)
+    assert not is_valid
+    assert "symbolic link" in err_msg.lower()
+
+
+def test_host_output_validation_rejects_non_regular_files(tmp_path):
+    """
+    [CROSS-PLATFORM UNIT TEST]
+    Verifies that _validate_host_output_files rejects non-regular files (e.g. directories).
+    """
+    out_dir = str(tmp_path / "out")
+    os.makedirs(out_dir, exist_ok=True)
+
+    resp_path = os.path.join(out_dir, "response.json")
+    os.makedirs(resp_path, exist_ok=True)  # response.json is a directory
+    arrow_path = os.path.join(out_dir, "output_data.arrow")
+
+    is_valid, err_msg = sandbox._validate_host_output_files(out_dir, resp_path, arrow_path)
+    assert not is_valid
+    assert "not a regular file" in err_msg.lower()
+
+
+def test_host_output_validation_enforces_size_limits(tmp_path):
+    """
+    [CROSS-PLATFORM UNIT TEST]
+    Verifies that _validate_host_output_files rejects files that exceed byte limits.
+    """
+    out_dir = str(tmp_path / "out")
+    os.makedirs(out_dir, exist_ok=True)
+
+    resp_path = os.path.join(out_dir, "response.json")
+    arrow_path = os.path.join(out_dir, "output_data.arrow")
+
+    # 1. Oversized response JSON
+    with open(resp_path, "wb") as f:
+        f.write(b"X" * 200)
+
+    is_valid, err_msg = sandbox._validate_host_output_files(
+        out_dir, resp_path, arrow_path, max_resp_bytes=100
+    )
+    assert not is_valid
+    assert "exceeds limit" in err_msg.lower()
+
+    # 2. Valid response JSON, oversized arrow file
+    with open(resp_path, "wb") as f:
+        f.write(b"X" * 50)
+    with open(arrow_path, "wb") as f:
+        f.write(b"Y" * 200)
+
+    is_valid, err_msg = sandbox._validate_host_output_files(
+        out_dir, resp_path, arrow_path, max_resp_bytes=100, max_arrow_bytes=100
+    )
+    assert not is_valid
+    assert "exceeds limit" in err_msg.lower()
+
+
+def test_linux_docker_unavailable_fails_closed(sample_df, monkeypatch):
+    """
+    [CROSS-PLATFORM UNIT TEST]
+    Verifies that when running under the Docker containment policy and Docker is unavailable,
+    execution strictly fails closed with an informative error rather than falling back to
+    unrestricted host subprocess execution.
+    """
+    # Mock Docker as unavailable
+    monkeypatch.setattr(sandbox, "_is_docker_available", lambda: False)
+
+    executor = SandboxExecutor(backend="docker")
+    success, error_msg = executor.execute("result = 1", sample_df)
+
+    assert success is False
+    assert "linux execution requires docker containment" in error_msg.lower()
+    assert "fail-closed" in error_msg.lower()
+
+
+def test_sandbox_worker_separated_in_out_dir_cli(tmp_path, sample_df):
+    """
+    [CROSS-PLATFORM INTEGRATION TEST]
+    Verifies that sandbox_worker.py operates correctly when invoked with separated
+    --in-dir and --out-dir command line flags.
+    """
+    in_dir = tmp_path / "in"
+    out_dir = tmp_path / "out"
+    in_dir.mkdir()
+    out_dir.mkdir()
+
+    req_payload = {
+        "code": "result = df['price'].sum()",
+        "version": "1.0",
+        "max_result_arrow_bytes": 10 * 1024 * 1024,
+        "max_response_json_bytes": 1 * 1024 * 1024,
+    }
+    (in_dir / "request.json").write_text(json.dumps(req_payload), encoding="utf-8")
+
+    table = pa.Table.from_pandas(sample_df)
+    with open(in_dir / "input_data.arrow", "wb") as f:
+        with ipc.new_stream(f, table.schema) as writer:
+            writer.write_table(table)
+
+    cmd = [
+        sys.executable,
+        "-u",
+        str(sandbox.WORKER_SCRIPT),
+        "--in-dir",
+        str(in_dir),
+        "--out-dir",
+        str(out_dir),
+    ]
+    proc = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5.0)
+    assert proc.returncode == 0
+
+    resp_file = out_dir / "response.json"
+    assert resp_file.exists()
+    with open(resp_file, "r", encoding="utf-8") as f:
+        resp = json.load(f)
+
+    assert resp.get("status") == "success"
+    assert resp.get("scalar_value") == 1400.0
+
+
+def test_docker_cleanup_helper_tolerates_missing_container():
+    """
+    [UNIT TEST]
+    Verifies that _kill_and_remove_docker_container handles nonexistent containers safely
+    without raising exceptions.
+    """
+    sandbox._kill_and_remove_docker_container("nonexistent_sandbox_container_999999")
+
+
+@pytest.mark.skipif(
+    not sandbox._is_docker_available(),
+    reason="[REAL DOCKER KERNEL INTEGRATION TEST] Requires Docker daemon and container image"
+)
+def test_docker_real_container_network_isolation_integration(sample_df):
+    """
+    [REAL LINUX / DOCKER INTEGRATION TEST]
+    Validates that --network none blocks all outbound network socket connections.
+    """
+    code = (
+        "import urllib.request\n"
+        "try:\n"
+        "    urllib.request.urlopen('http://1.1.1.1', timeout=1.0)\n"
+        "    result = 'CONNECTED'\n"
+        "except Exception as e:\n"
+        "    result = f'BLOCKED: {type(e).__name__}'\n"
+    )
+    executor = SandboxExecutor(backend="docker")
+    success, res = executor.execute(code, sample_df)
+    assert success is True
+    assert "BLOCKED" in str(res)
+
+
+@pytest.mark.skipif(
+    not sandbox._is_docker_available(),
+    reason="[REAL DOCKER KERNEL INTEGRATION TEST] Requires Docker daemon and container image"
+)
+def test_docker_real_container_read_only_rootfs_integration(sample_df):
+    """
+    [REAL LINUX / DOCKER INTEGRATION TEST]
+    Validates that --read-only prevents writes to the container root filesystem.
+    """
+    code = (
+        "try:\n"
+        "    with open('/workspace/malicious.txt', 'w') as f:\n"
+        "        f.write('pwned')\n"
+        "    result = 'WRITTEN'\n"
+        "except OSError as e:\n"
+        "    result = f'READ_ONLY: {type(e).__name__}'\n"
+    )
+    executor = SandboxExecutor(backend="docker")
+    success, res = executor.execute(code, sample_df)
+    assert success is True
+    assert "READ_ONLY" in str(res)
+
+
+@pytest.mark.skipif(
+    not sandbox._is_docker_available(),
+    reason="[REAL DOCKER KERNEL INTEGRATION TEST] Requires Docker daemon and container image"
+)
+def test_docker_real_container_timeout_and_cleanup_integration(sample_df):
+    """
+    [REAL LINUX / DOCKER INTEGRATION TEST]
+    Validates that a runaway container is forcefully terminated and destroyed within timeout.
+    """
+    code = "while True: pass"
+    executor = SandboxExecutor(backend="docker")
+    success, error_msg = executor.execute(code, sample_df, timeout_seconds=2.0)
+    assert success is False
+    assert "timed out" in error_msg.lower()
