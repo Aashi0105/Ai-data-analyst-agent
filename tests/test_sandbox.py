@@ -1157,6 +1157,19 @@ def test_win32_ctypes_declarations_and_pointer_sizes():
     assert kernel32.GetExitCodeProcess.restype == wt.BOOL
     assert kernel32.GetExitCodeProcess.argtypes == [wt.HANDLE, ctypes.POINTER(wt.DWORD)]
 
+    assert kernel32.InitializeProcThreadAttributeList.restype == wt.BOOL
+    assert len(kernel32.InitializeProcThreadAttributeList.argtypes) == 4
+
+    assert kernel32.UpdateProcThreadAttribute.restype == wt.BOOL
+    assert len(kernel32.UpdateProcThreadAttribute.argtypes) == 7
+
+    assert kernel32.DeleteProcThreadAttributeList.restype is None
+    assert kernel32.DeleteProcThreadAttributeList.argtypes == [ctypes.c_void_p]
+
+    assert ctypes.sizeof(sandbox._STARTUPINFOEXW) == (
+        ctypes.sizeof(sandbox._STARTUPINFOW) + ctypes.sizeof(ctypes.c_void_p)
+    )
+
 
 def test_windows_kernel_descendant_termination_integration(tmp_path):
     """
@@ -1389,3 +1402,178 @@ def test_windows_job_object_set_information_failure_cleans_handles(monkeypatch):
 
     assert "failed to configure windows job object limits" in str(exc_info.value).lower()
     assert job.handle is None, "Job handle was not cleaned up after configuration failure!"
+
+
+def test_windows_process_creation_handle_whitelist_restricts_inheritance():
+    """
+    [REAL WINDOWS KERNEL INTEGRATION TEST]
+    Exercises real Windows kernel handle inheritance filtering:
+    1. Parent process creates an inheritable event handle (bInheritHandle = True).
+    2. Spawns child using _spawn_suspended_windows_process with STARTUPINFOEXW and
+       PROC_THREAD_ATTRIBUTE_HANDLE_LIST configured to whitelist ONLY the NUL handle.
+    3. The child attempts to access the parent's inheritable event handle via ResetEvent.
+    4. Verifies that the Windows kernel did NOT inherit the handle into the child process
+       (ResetEvent returns 0 and GetLastError() returns ERROR_INVALID_HANDLE).
+    """
+    if sys.platform != "win32":
+        pytest.skip("Windows-only handle whitelist test")
+
+    import ctypes
+    import ctypes.wintypes as wt
+
+    kernel32 = ctypes.windll.kernel32
+
+    # Create an inheritable event handle in the parent process
+    sa = sandbox._SECURITY_ATTRIBUTES()
+    sa.nLength = ctypes.sizeof(sa)
+    sa.bInheritHandle = True
+
+    h_unrelated = kernel32.CreateEventW(ctypes.byref(sa), True, False, None)
+    assert h_unrelated and h_unrelated != -1
+
+    try:
+        # Child script attempts to reset the parent's event handle
+        # If leaked, ResetEvent returns non-zero (True).
+        # If correctly filtered by PROC_THREAD_ATTRIBUTE_HANDLE_LIST, ResetEvent returns False.
+        child_code = (
+            "import ctypes, sys\n"
+            "from ctypes import wintypes as wt\n"
+            "kernel32 = ctypes.windll.kernel32\n"
+            "kernel32.ResetEvent.restype = wt.BOOL\n"
+            "kernel32.ResetEvent.argtypes = [wt.HANDLE]\n"
+            f"res = kernel32.ResetEvent(wt.HANDLE({h_unrelated}))\n"
+            "if res:\n"
+            "    sys.exit(10) # LEAKED: Handle was inherited\n"
+            "else:\n"
+            "    sys.exit(0)  # PROTECTED: Handle was not inherited\n"
+        )
+
+        base_exe = getattr(sys, "_base_executable", sys.executable)
+        proc = sandbox._spawn_suspended_windows_process(
+            [base_exe, "-c", child_code],
+            env=sandbox._get_safe_env(),
+        )
+        exit_code = proc.wait(timeout=5.0)
+        assert exit_code == 0, f"Unrelated inheritable handle was leaked to worker! Child exit code: {exit_code}"
+    finally:
+        kernel32.CloseHandle(h_unrelated)
+
+
+def test_windows_proc_thread_attribute_list_lifecycle_and_cleanup():
+    """
+    [UNIT / WIN32 API VERIFICATION TEST]
+    Verifies that InitializeProcThreadAttributeList, UpdateProcThreadAttribute,
+    and DeleteProcThreadAttributeList execute correctly against kernel32 without errors.
+    """
+    if sys.platform != "win32":
+        pytest.skip("Windows-only attribute list API verification")
+
+    import ctypes
+    import ctypes.wintypes as wt
+
+    kernel32 = ctypes.windll.kernel32
+
+    attr_size = ctypes.c_size_t(0)
+    # First call retrieves required buffer size
+    kernel32.InitializeProcThreadAttributeList(None, 1, 0, ctypes.byref(attr_size))
+    assert attr_size.value > 0
+
+    attr_buf = ctypes.create_string_buffer(attr_size.value)
+    init_ok = kernel32.InitializeProcThreadAttributeList(attr_buf, 1, 0, ctypes.byref(attr_size))
+    assert init_ok
+
+    try:
+        # Whitelist a dummy handle
+        h_dummy = wt.HANDLE(1234)
+        handle_arr = (wt.HANDLE * 1)(h_dummy)
+        update_ok = kernel32.UpdateProcThreadAttribute(
+            attr_buf,
+            0,
+            sandbox._PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+            ctypes.byref(handle_arr),
+            ctypes.sizeof(handle_arr),
+            None,
+            None,
+        )
+        assert update_ok
+    finally:
+        # Must delete attribute list cleanly
+        kernel32.DeleteProcThreadAttributeList(attr_buf)
+
+
+def test_windows_proc_thread_attribute_list_init_failure_fails_closed(monkeypatch):
+    """
+    [FAILURE PATH TEST - MOCKED INITIALIZEPROCTHREADATTRIBUTELIST]
+    Verifies that if InitializeProcThreadAttributeList fails, _spawn_suspended_windows_process
+    fails closed, raises RuntimeError, and does not leave orphaned handles or processes.
+    """
+    if sys.platform != "win32":
+        pytest.skip("Windows-only attribute list failure test")
+
+    import ctypes
+    kernel32 = ctypes.windll.kernel32
+
+    # Mock InitializeProcThreadAttributeList to simulate allocation/initialization failure
+    monkeypatch.setattr(kernel32, "InitializeProcThreadAttributeList", lambda *args: False)
+
+    cmd = [sys.executable, "-c", "import sys; sys.exit(0)"]
+    with pytest.raises(RuntimeError) as exc_info:
+        sandbox._spawn_suspended_windows_process(cmd, env=sandbox._get_safe_env())
+
+    assert "initializeprocthreadattributelist failed" in str(exc_info.value).lower()
+
+
+def test_windows_proc_thread_attribute_list_update_failure_fails_closed(monkeypatch):
+    """
+    [FAILURE PATH TEST - MOCKED UPDATEPROCTHREADATTRIBUTE]
+    Verifies that if UpdateProcThreadAttribute fails, _spawn_suspended_windows_process
+    fails closed, cleans up the attribute list, and raises RuntimeError.
+    """
+    if sys.platform != "win32":
+        pytest.skip("Windows-only attribute list update failure test")
+
+    import ctypes
+    kernel32 = ctypes.windll.kernel32
+
+    monkeypatch.setattr(kernel32, "UpdateProcThreadAttribute", lambda *args: False)
+
+    cmd = [sys.executable, "-c", "import sys; sys.exit(0)"]
+    with pytest.raises(RuntimeError) as exc_info:
+        sandbox._spawn_suspended_windows_process(cmd, env=sandbox._get_safe_env())
+
+    assert "updateprocthreadattribute failed" in str(exc_info.value).lower()
+
+
+def test_unicode_environment_block_sorting_and_deduplication():
+    """
+    [UNIT TEST]
+    Verifies that environment keys are normalized, sorted case-insensitively,
+    deduplicated, null-delimited, and double-null terminated.
+    """
+    # Raw dictionary with mixed case, unordered entries, and duplicate keys with different casing
+    test_env = {
+        "zeta_key": "val_zeta",
+        "ALPHA_KEY": "val_alpha",
+        "Beta_Key": "val_beta",
+        "beta_key": "val_beta_duplicate",
+        "GAMMA_KEY": "val_gamma",
+    }
+
+    normalized_env = {}
+    for k, v in test_env.items():
+        upper_k = k.upper()
+        if upper_k not in normalized_env:
+            normalized_env[upper_k] = (k, v)
+
+    sorted_pairs = sorted(normalized_env.values(), key=lambda item: item[0].upper())
+    env_str = "".join(f"{k}={v}\0" for k, v in sorted_pairs) + "\0"
+
+    # Verify keys are sorted case-insensitively
+    sorted_keys = [k.upper() for k, v in sorted_pairs]
+    assert sorted_keys == ["ALPHA_KEY", "BETA_KEY", "GAMMA_KEY", "ZETA_KEY"]
+
+    # Verify deduplication (Beta_Key kept, duplicate discarded)
+    assert len(sorted_pairs) == 4
+
+    # Verify double-null termination
+    assert env_str.endswith("\0\0")

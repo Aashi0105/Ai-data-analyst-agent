@@ -157,7 +157,12 @@ def _get_safe_env() -> Dict[str, str]:
         "PYTHONIOENCODING",
         "PYTHONUTF8",
     }
-    safe_env = {k: v for k, v in os.environ.items() if k.upper() in allowed_keys}
+    safe_env: Dict[str, str] = {}
+    for k, v in os.environ.items():
+        upper_k = k.upper()
+        if upper_k in allowed_keys and upper_k not in safe_env:
+            safe_env[upper_k] = v
+
     safe_env["PYTHONUNBUFFERED"] = "1"
     safe_env["PYTHONIOENCODING"] = "utf-8"
     return safe_env
@@ -238,6 +243,12 @@ if sys.platform == "win32":
             ("dwThreadId", wt.DWORD),
         ]
 
+    class _STARTUPINFOEXW(ctypes.Structure):
+        _fields_ = [
+            ("StartupInfo", _STARTUPINFOW),
+            ("lpAttributeList", ctypes.c_void_p),
+        ]
+
     class _SECURITY_ATTRIBUTES(ctypes.Structure):
         _fields_ = [
             ("nLength", wt.DWORD),
@@ -276,7 +287,7 @@ if sys.platform == "win32":
         wt.DWORD,
         ctypes.c_void_p,
         wt.LPCWSTR,
-        ctypes.POINTER(_STARTUPINFOW),
+        ctypes.c_void_p,  # Accepts pointer to _STARTUPINFOW or _STARTUPINFOEXW
         ctypes.POINTER(_PROCESS_INFORMATION),
     ]
 
@@ -303,6 +314,28 @@ if sys.platform == "win32":
         wt.HANDLE,
     ]
 
+    kernel32.InitializeProcThreadAttributeList.restype = wt.BOOL
+    kernel32.InitializeProcThreadAttributeList.argtypes = [
+        ctypes.c_void_p,
+        wt.DWORD,
+        wt.DWORD,
+        ctypes.POINTER(ctypes.c_size_t),
+    ]
+
+    kernel32.UpdateProcThreadAttribute.restype = wt.BOOL
+    kernel32.UpdateProcThreadAttribute.argtypes = [
+        ctypes.c_void_p,
+        wt.DWORD,
+        ctypes.c_size_t,
+        ctypes.c_void_p,
+        ctypes.c_size_t,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+    ]
+
+    kernel32.DeleteProcThreadAttributeList.restype = None
+    kernel32.DeleteProcThreadAttributeList.argtypes = [ctypes.c_void_p]
+
     kernel32.GetLastError.restype = wt.DWORD
     kernel32.GetLastError.argtypes = []
 
@@ -311,6 +344,9 @@ if sys.platform == "win32":
     _JOB_OBJECT_LIMIT_PROCESS_MEMORY = 0x00000100
     _JOB_OBJECT_LIMIT_JOB_MEMORY = 0x00000200
     _JobObjectExtendedLimitInformation = 9
+
+    _EXTENDED_STARTUPINFO_PRESENT = 0x00080000
+    _PROC_THREAD_ATTRIBUTE_HANDLE_LIST = 0x00020002
 
 
 class WindowsJobObject:
@@ -517,13 +553,18 @@ def _spawn_suspended_windows_process(
     cmd_str = subprocess.list2cmdline(cmd)
     cmd_buf = ctypes.create_unicode_buffer(cmd_str)
 
-    # Unicode environment block: sequence of null-terminated strings ending with double null
-    env_str = "".join(f"{k}={v}\0" for k, v in env.items()) + "\0"
-    env_buf = ctypes.create_unicode_buffer(env_str)
+    # Format Unicode environment block: null-separated, double-null-terminated,
+    # sorted in alphabetical order, case-insensitive (required by Windows SDK).
+    # Keys are deduplicated case-insensitively.
+    normalized_env: Dict[str, str] = {}
+    for k, v in env.items():
+        upper_k = k.upper()
+        if upper_k not in normalized_env:
+            normalized_env[upper_k] = (k, v)
 
-    si = _STARTUPINFOW()
-    si.cb = ctypes.sizeof(si)
-    pi = _PROCESS_INFORMATION()
+    sorted_pairs = sorted(normalized_env.values(), key=lambda item: item[0].upper())
+    env_str = "".join(f"{k}={v}\0" for k, v in sorted_pairs) + "\0"
+    env_buf = ctypes.create_unicode_buffer(env_str)
 
     # Route standard handles to NUL with bInheritHandle=True so worker print/logging does not raise OSError
     sa = _SECURITY_ATTRIBUTES()
@@ -546,20 +587,58 @@ def _spawn_suspended_windows_process(
         and h_nul != -1
     )
 
-    if h_nul_valid:
-        si.dwFlags |= 0x00000100  # STARTF_USESTDHANDLES
-        si.hStdInput = h_nul
-        si.hStdOutput = h_nul
-        si.hStdError = h_nul
-        b_inherit = True
-    else:
-        b_inherit = False
+    attr_buf = None
+    attr_initialized = False
 
-    # CREATE_SUSPENDED (0x04) | CREATE_NEW_PROCESS_GROUP (0x200) | CREATE_NO_WINDOW (0x08000000) | CREATE_UNICODE_ENVIRONMENT (0x400)
+    # SUSPENDED (0x04) | NEW_PROCESS_GROUP (0x200) | NO_WINDOW (0x08000000) | UNICODE_ENVIRONMENT (0x400)
     flags = 0x00000004 | 0x00000200 | 0x08000000 | 0x00000400
     cwd_buf = ctypes.create_unicode_buffer(cwd) if cwd else None
+    pi = _PROCESS_INFORMATION()
 
     try:
+        if h_nul_valid:
+            # Initialize thread attribute list to explicitly whitelist ONLY h_nul
+            attr_size = ctypes.c_size_t(0)
+            kernel32.InitializeProcThreadAttributeList(None, 1, 0, ctypes.byref(attr_size))
+            if attr_size.value == 0:
+                err = kernel32.GetLastError()
+                raise RuntimeError(f"InitializeProcThreadAttributeList failed to calculate size: error code {err}")
+
+            attr_buf = ctypes.create_string_buffer(attr_size.value)
+            if not kernel32.InitializeProcThreadAttributeList(attr_buf, 1, 0, ctypes.byref(attr_size)):
+                err = kernel32.GetLastError()
+                raise RuntimeError(f"InitializeProcThreadAttributeList failed: error code {err}")
+            attr_initialized = True
+
+            handle_array = (wt.HANDLE * 1)(h_nul)
+            if not kernel32.UpdateProcThreadAttribute(
+                attr_buf,
+                0,
+                _PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+                ctypes.byref(handle_array),
+                ctypes.sizeof(handle_array),
+                None,
+                None,
+            ):
+                err = kernel32.GetLastError()
+                raise RuntimeError(f"UpdateProcThreadAttribute failed: error code {err}")
+
+            siex = _STARTUPINFOEXW()
+            siex.StartupInfo.cb = ctypes.sizeof(siex)
+            siex.StartupInfo.dwFlags = 0x00000100  # STARTF_USESTDHANDLES
+            siex.StartupInfo.hStdInput = h_nul
+            siex.StartupInfo.hStdOutput = h_nul
+            siex.StartupInfo.hStdError = h_nul
+            siex.lpAttributeList = ctypes.cast(attr_buf, ctypes.c_void_p)
+            startup_info_ptr = ctypes.byref(siex)
+            flags |= _EXTENDED_STARTUPINFO_PRESENT
+            b_inherit = True
+        else:
+            si = _STARTUPINFOW()
+            si.cb = ctypes.sizeof(si)
+            startup_info_ptr = ctypes.byref(si)
+            b_inherit = False
+
         success = kernel32.CreateProcessW(
             None,
             cmd_buf,
@@ -569,10 +648,12 @@ def _spawn_suspended_windows_process(
             flags,
             ctypes.byref(env_buf),
             cwd_buf,
-            ctypes.byref(si),
+            startup_info_ptr,
             ctypes.byref(pi),
         )
     finally:
+        if attr_initialized and attr_buf:
+            kernel32.DeleteProcThreadAttributeList(attr_buf)
         if h_nul_valid:
             kernel32.CloseHandle(h_nul)
 
