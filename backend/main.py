@@ -6,6 +6,7 @@ Integrates the existing Python analysis core (agent.py, validator.py,
 sandbox.py, charts.py, utils.py) into a clean, strongly-typed HTTP interface.
 """
 
+import io
 import os
 import sys
 import uuid
@@ -20,7 +21,7 @@ if WORKSPACE_ROOT not in sys.path:
     sys.path.insert(0, WORKSPACE_ROOT)
 
 import re
-from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi import FastAPI, Request, UploadFile, File, HTTPException
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
@@ -30,6 +31,13 @@ from agent import DataAnalystAgent
 from validator import clean_code, validate_code
 from sandbox import execute_pandas_code
 from backend.chart_utils import build_recharts_data
+
+# ============================================================================
+# Upload Constraints
+# ============================================================================
+MAX_UPLOAD_SIZE_MB = 25
+MAX_UPLOAD_SIZE_BYTES = MAX_UPLOAD_SIZE_MB * 1024 * 1024  # 26,214,400 bytes
+UPLOAD_CHUNK_SIZE_BYTES = 1024 * 1024  # 1 MiB chunk reading
 
 # ============================================================================
 # In-Memory Dataset Store
@@ -182,20 +190,52 @@ def health_check() -> Dict[str, Any]:
 
 
 @app.post("/api/datasets/upload", response_model=DatasetMetadataResponse)
-async def upload_dataset(file: UploadFile = File(...)) -> DatasetMetadataResponse:
+async def upload_dataset(request: Request, file: UploadFile = File(...)) -> DatasetMetadataResponse:
     """
     Ingests a user-uploaded CSV file, profiles the schema,
     and stores the DataFrame in in-memory session storage.
+    Enforces a strict maximum file size of 25 MiB via bounded chunk reading.
     """
-    if not file.filename.lower().endswith(".csv"):
+    if not file.filename or not file.filename.lower().endswith(".csv"):
         raise HTTPException(status_code=400, detail="Only CSV files (.csv) are currently supported.")
 
+    # Early rejection if Content-Length header is present and significantly exceeds max allowed limit + multipart framing
+    MULTIPART_OVERHEAD_ALLOWANCE = 64 * 1024  # 64 KiB allowance for multipart form headers and boundaries
+    content_length_header = request.headers.get("content-length")
+    if content_length_header and content_length_header.isdigit():
+        if int(content_length_header) > (MAX_UPLOAD_SIZE_BYTES + MULTIPART_OVERHEAD_ALLOWANCE):
+            raise HTTPException(
+                status_code=413,
+                detail=f"File size exceeds the maximum allowed limit of {MAX_UPLOAD_SIZE_MB} MiB."
+            )
+
+    buffer = io.BytesIO()
+    total_bytes = 0
+
     try:
-        df = load_csv(file.file)
+        while True:
+            chunk = await file.read(UPLOAD_CHUNK_SIZE_BYTES)
+            if not chunk:
+                break
+            total_bytes += len(chunk)
+            if total_bytes > MAX_UPLOAD_SIZE_BYTES:
+                raise HTTPException(
+                    status_code=413,
+                    detail=f"File size exceeds the maximum allowed limit of {MAX_UPLOAD_SIZE_MB} MiB."
+                )
+            buffer.write(chunk)
+
+        buffer.seek(0)
+        df = load_csv(buffer)
+    except HTTPException:
+        raise
     except ValueError as ve:
         raise HTTPException(status_code=400, detail=str(ve))
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to process CSV: {str(e)}")
+    finally:
+        buffer.close()
+        await file.close()
 
     dataset_id = str(uuid.uuid4())
     DATASET_STORE[dataset_id] = {

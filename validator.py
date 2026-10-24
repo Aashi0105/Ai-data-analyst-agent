@@ -46,11 +46,39 @@ ALLOWED_NODE_TYPES: Set[Type[ast.AST]] = {
 if hasattr(ast, "Index"):
     ALLOWED_NODE_TYPES.add(getattr(ast, "Index"))
 
-# Forbidden builtins, modules, and identifiers
+# Forbidden builtins, modules, identifiers, and DataFrame I/O / reflection operations
 FORBIDDEN_NAMES: Set[str] = {
+    # System, execution & process execution
     "exec", "eval", "open", "compile", "globals", "locals", "vars", "input",
     "exit", "quit", "__import__", "os", "sys", "subprocess", "socket",
-    "shutil", "pathlib", "pickle", "requests", "urllib"
+    "shutil", "pathlib", "pickle", "requests", "urllib", "http",
+    # Reflection & dynamic attribute dispatch
+    "getattr", "hasattr", "setattr", "delattr",
+    # Pandas & NumPy file and network I/O, serialization, and database methods
+    "read_pickle", "to_pickle",
+    "read_csv", "to_csv",
+    "read_table",
+    "read_fwf",
+    "read_parquet", "to_parquet",
+    "read_excel", "to_excel",
+    "read_sql", "to_sql", "read_sql_query", "read_sql_table",
+    "read_feather", "to_feather",
+    "read_hdf", "to_hdf",
+    "read_json", "to_json",
+    "read_html", "to_html",
+    "read_xml", "to_xml",
+    "read_clipboard", "to_clipboard",
+    "to_stata", "read_stata",
+    "read_spss",
+    "read_sas",
+    "read_orc", "to_orc",
+    "read_gbq", "to_gbq",
+    # NumPy file I/O & memory mapping
+    "fromfile", "tofile",
+    "load", "save", "savez", "savez_compressed",
+    "loadtxt", "savetxt", "genfromtxt", "fromregex", "memmap",
+    # Dynamic expression evaluation & function execution
+    "query", "pipe",
 }
 
 # User-friendly messages for common forbidden constructs

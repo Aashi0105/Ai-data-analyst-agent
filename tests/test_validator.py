@@ -269,3 +269,129 @@ def test_allows_markdown_fence_cleaning():
     fenced_code = "```python\nresult = df['revenue'].sum()\n```"
     is_valid, msg = validate_code(fenced_code)
     assert is_valid, f"Expected valid, got: {msg}"
+
+
+# =====================================================================
+# 4. Dangerous Pandas I/O and Evaluator Rejection Tests
+# =====================================================================
+
+@pytest.mark.parametrize("method_name", [
+    "to_csv", "read_csv",
+    "to_pickle", "read_pickle",
+    "to_parquet", "read_parquet",
+    "to_excel", "read_excel",
+    "to_sql", "read_sql", "read_sql_query", "read_sql_table",
+    "to_feather", "read_feather",
+    "to_hdf", "read_hdf",
+    "to_json", "read_json",
+    "to_html", "read_html",
+    "to_xml", "read_xml",
+    "to_clipboard", "read_clipboard",
+    "tofile", "fromfile"
+])
+def test_blocks_dangerous_pandas_io_methods(method_name):
+    """Verify that file I/O, networking, and serialization methods are rejected on df or pd."""
+    code_df = f"result = df.{method_name}('target_file')"
+    is_valid_df, msg_df = validate_code(code_df)
+    assert not is_valid_df, f"Expected {method_name} on df to be rejected"
+    assert f"forbidden attribute '{method_name}'" in msg_df
+
+    code_pd = f"result = pd.{method_name}('target_file')"
+    is_valid_pd, msg_pd = validate_code(code_pd)
+    assert not is_valid_pd, f"Expected {method_name} on pd to be rejected"
+    assert f"forbidden attribute '{method_name}'" in msg_pd
+
+
+def test_blocks_dataframe_query():
+    """Verify that df.query() is rejected as dynamic expression evaluation."""
+    code = "result = df.query('revenue > 100')"
+    is_valid, msg = validate_code(code)
+    assert not is_valid
+    assert "forbidden attribute 'query'" in msg
+
+
+def test_blocks_dataframe_eval():
+    """Verify that df.eval() and pd.eval() are rejected as dynamic expression evaluation."""
+    code_df = "result = df.eval('total = revenue * quantity')"
+    is_valid, msg = validate_code(code_df)
+    assert not is_valid
+    assert "forbidden attribute 'eval'" in msg
+
+    code_pd = "result = pd.eval('1 + 1')"
+    is_valid, msg = validate_code(code_pd)
+    assert not is_valid
+    assert "forbidden attribute 'eval'" in msg
+
+
+def test_blocks_dataframe_pipe():
+    """Verify that df.pipe() is rejected to prevent arbitrary callable execution."""
+    code = "result = df.pipe(some_function)"
+    is_valid, msg = validate_code(code)
+    assert not is_valid
+    assert "forbidden attribute 'pipe'" in msg
+
+
+@pytest.mark.parametrize("reflection_fn", ["getattr", "hasattr", "setattr", "delattr"])
+def test_blocks_reflection_identifiers_and_attributes(reflection_fn):
+    """Verify that reflection functions are blocked as both bare identifiers and attribute accesses."""
+    code_call = f"result = {reflection_fn}(df, 'head')(5)"
+    is_valid, msg = validate_code(code_call)
+    assert not is_valid
+    assert f"forbidden identifier '{reflection_fn}'" in msg
+
+    code_attr = f"result = df.{reflection_fn}('head')"
+    is_valid_attr, msg_attr = validate_code(code_attr)
+    assert not is_valid_attr
+    assert f"forbidden attribute '{reflection_fn}'" in msg_attr
+
+
+# =====================================================================
+# 5. Legitimate Analytical Operations Preservation Tests
+# =====================================================================
+
+@pytest.mark.parametrize("operation", [
+    "result = df.head(10)",
+    "result = df.tail(5)",
+    "result = df.describe()",
+    "result = df.groupby('region')['revenue'].sum()",
+    "result = df.pivot_table(index='region', values='revenue', aggfunc='mean')",
+    "result = df.sort_values(by='revenue', ascending=False)",
+    "result = df.dropna(subset=['revenue'])",
+    "result = df.fillna(0)",
+    "result = df.reset_index()",
+    "result = df['revenue'].corr(df['quantity'])",
+    "result = df['category'].nunique()",
+    "result = df[df['revenue'].between(100, 500)]",
+    "result = df.select_dtypes(include=['number'])"
+])
+def test_preserves_legitimate_analytical_operations(operation):
+    """Verify that standard exploratory data analysis operations continue to validate safely."""
+    is_valid, msg = validate_code(operation)
+    assert is_valid, f"Operation '{operation}' was unexpectedly rejected: {msg}"
+
+
+# =====================================================================
+# 6. Pandas and NumPy Dangerous I/O Rejection Tests
+# =====================================================================
+
+@pytest.mark.parametrize("dangerous_method", [
+    "read_table", "read_fwf", "read_spss", "read_sas", "read_orc", "to_orc", "read_gbq", "to_gbq"
+])
+def test_blocks_pandas_io_methods(dangerous_method):
+    """Verify that dangerous Pandas file and network I/O methods are blocked."""
+    code = f"result = pd.{dangerous_method}('sensitive_data')"
+    is_valid, msg = validate_code(code)
+    assert not is_valid
+    assert f"forbidden attribute '{dangerous_method}'" in msg
+
+
+@pytest.mark.parametrize("numpy_io_method", [
+    "load", "save", "savez", "savez_compressed", "loadtxt", "savetxt", "genfromtxt", "fromregex", "memmap"
+])
+def test_blocks_numpy_io_methods(numpy_io_method):
+    """Verify that NumPy file I/O and memory mapping functions are blocked."""
+    code = f"result = np.{numpy_io_method}('payload.npy')"
+    is_valid, msg = validate_code(code)
+    assert not is_valid
+    assert f"forbidden attribute '{numpy_io_method}'" in msg
+

@@ -69,6 +69,95 @@ def test_upload_invalid_extension(client):
     assert "Only CSV files" in response.json()["detail"]
 
 
+def test_upload_empty_file_rejected(client):
+    """Verify that uploading an empty CSV (0 bytes) is rejected with HTTP 400."""
+    file_obj = io.BytesIO(b"")
+    response = client.post(
+        "/api/datasets/upload",
+        files={"file": ("empty.csv", file_obj, "text/csv")}
+    )
+    assert response.status_code == 400
+    assert "empty" in response.json()["detail"].lower() or "no data" in response.json()["detail"].lower()
+
+
+def test_upload_exact_size_boundary(client, monkeypatch):
+    """Verify an upload at the exact accepted byte boundary succeeds."""
+    import backend.main as backend_main
+    csv_content = b"col1,col2\nval1,10\nval2,20"
+    content_len = len(csv_content)
+    monkeypatch.setattr(backend_main, "MAX_UPLOAD_SIZE_BYTES", content_len)
+    monkeypatch.setattr(backend_main, "MAX_UPLOAD_SIZE_MB", round(content_len / (1024 * 1024), 4))
+
+    file_obj = io.BytesIO(csv_content)
+    response = client.post(
+        "/api/datasets/upload",
+        files={"file": ("boundary.csv", file_obj, "text/csv")}
+    )
+    assert response.status_code == 200
+    assert response.json()["num_rows"] == 2
+
+
+def test_upload_oversized_rejected_with_413(client, monkeypatch):
+    """Verify an upload exceeding the size limit is rejected with HTTP 413 and no dataset leak."""
+    import backend.main as backend_main
+    csv_content = b"col1,col2\nval1,10\nval2,20\nval3,30"
+    monkeypatch.setattr(backend_main, "MAX_UPLOAD_SIZE_BYTES", 15)
+    monkeypatch.setattr(backend_main, "MAX_UPLOAD_SIZE_MB", 25)
+
+    initial_datasets_count = len(backend_main.DATASET_STORE)
+    file_obj = io.BytesIO(csv_content)
+    response = client.post(
+        "/api/datasets/upload",
+        files={"file": ("oversized.csv", file_obj, "text/csv")}
+    )
+
+    assert response.status_code == 413
+    assert "exceeds" in response.json()["detail"].lower()
+    # Ensure no dataset entry was created in DATASET_STORE
+    assert len(backend_main.DATASET_STORE) == initial_datasets_count
+
+
+def test_upload_oversized_misleading_content_length_rejected(client, monkeypatch):
+    """
+    Verify that an upload with a misleadingly small Content-Length header
+    is still caught and rejected with HTTP 413 during stream reading.
+    """
+    import backend.main as backend_main
+    csv_content = b"col1,col2\nval1,10\nval2,20\nval3,30"
+    monkeypatch.setattr(backend_main, "MAX_UPLOAD_SIZE_BYTES", 15)
+
+    initial_datasets_count = len(backend_main.DATASET_STORE)
+    file_obj = io.BytesIO(csv_content)
+    # Header claims 5 bytes, but payload is larger than limit (15)
+    response = client.post(
+        "/api/datasets/upload",
+        files={"file": ("spoofed.csv", file_obj, "text/csv")},
+        headers={"content-length": "5"}
+    )
+
+    assert response.status_code == 413
+    assert "exceeds" in response.json()["detail"].lower()
+    assert len(backend_main.DATASET_STORE) == initial_datasets_count
+
+
+def test_upload_oversized_content_length_early_rejection(client, monkeypatch):
+    """Verify that an oversized Content-Length header triggers early 413 rejection."""
+    import backend.main as backend_main
+    monkeypatch.setattr(backend_main, "MAX_UPLOAD_SIZE_BYTES", 50)
+
+    initial_datasets_count = len(backend_main.DATASET_STORE)
+    file_obj = io.BytesIO(b"col1,col2\n1,2")
+    response = client.post(
+        "/api/datasets/upload",
+        files={"file": ("declared_large.csv", file_obj, "text/csv")},
+        headers={"content-length": str(100 * 1024 * 1024)}
+    )
+
+    assert response.status_code == 413
+    assert "exceeds" in response.json()["detail"].lower()
+    assert len(backend_main.DATASET_STORE) == initial_datasets_count
+
+
 def test_load_sample_dataset(client):
     """Verify the sample dataset endpoint loads ecommerce_sales.csv with correct dimensions."""
     response = client.post("/api/datasets/sample")
