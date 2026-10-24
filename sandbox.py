@@ -18,7 +18,7 @@ import tempfile
 import subprocess
 import threading
 from pathlib import Path
-from typing import Tuple, Any, Dict, Optional
+from typing import Tuple, Any, Dict, Optional, List
 import pandas as pd
 import numpy as np
 import pyarrow as pa
@@ -166,9 +166,14 @@ def _get_safe_env() -> Dict[str, str]:
 # =========================================================================
 # Windows Job Object OS-Level Process Containment
 # =========================================================================
+# =========================================================================
+# Windows Job Object OS-Level Process Containment
+# =========================================================================
 if sys.platform == "win32":
     import ctypes
     import ctypes.wintypes as wt
+
+    kernel32 = ctypes.windll.kernel32
 
     class _IO_COUNTERS(ctypes.Structure):
         _fields_ = [
@@ -203,6 +208,104 @@ if sys.platform == "win32":
             ("PeakJobMemoryLimit", ctypes.c_size_t),
         ]
 
+    class _STARTUPINFOW(ctypes.Structure):
+        _fields_ = [
+            ("cb", wt.DWORD),
+            ("lpReserved", wt.LPWSTR),
+            ("lpDesktop", wt.LPWSTR),
+            ("lpTitle", wt.LPWSTR),
+            ("dwX", wt.DWORD),
+            ("dwY", wt.DWORD),
+            ("dwXSize", wt.DWORD),
+            ("dwYSize", wt.DWORD),
+            ("dwXCountChars", wt.DWORD),
+            ("dwYCountChars", wt.DWORD),
+            ("dwFillAttribute", wt.DWORD),
+            ("dwFlags", wt.DWORD),
+            ("wShowWindow", wt.WORD),
+            ("cbReserved2", wt.WORD),
+            ("lpReserved2", ctypes.c_void_p),
+            ("hStdInput", wt.HANDLE),
+            ("hStdOutput", wt.HANDLE),
+            ("hStdError", wt.HANDLE),
+        ]
+
+    class _PROCESS_INFORMATION(ctypes.Structure):
+        _fields_ = [
+            ("hProcess", wt.HANDLE),
+            ("hThread", wt.HANDLE),
+            ("dwProcessId", wt.DWORD),
+            ("dwThreadId", wt.DWORD),
+        ]
+
+    class _SECURITY_ATTRIBUTES(ctypes.Structure):
+        _fields_ = [
+            ("nLength", wt.DWORD),
+            ("lpSecurityDescriptor", ctypes.c_void_p),
+            ("bInheritHandle", wt.BOOL),
+        ]
+
+    # Explicit Win32 API signatures to prevent 64-bit handle truncation or pointer sign-extension bugs
+    kernel32.CreateJobObjectW.restype = wt.HANDLE
+    kernel32.CreateJobObjectW.argtypes = [ctypes.c_void_p, wt.LPCWSTR]
+
+    kernel32.SetInformationJobObject.restype = wt.BOOL
+    kernel32.SetInformationJobObject.argtypes = [
+        wt.HANDLE,
+        ctypes.c_int,
+        ctypes.c_void_p,
+        wt.DWORD,
+    ]
+
+    kernel32.AssignProcessToJobObject.restype = wt.BOOL
+    kernel32.AssignProcessToJobObject.argtypes = [wt.HANDLE, wt.HANDLE]
+
+    kernel32.TerminateJobObject.restype = wt.BOOL
+    kernel32.TerminateJobObject.argtypes = [wt.HANDLE, wt.UINT]
+
+    kernel32.CloseHandle.restype = wt.BOOL
+    kernel32.CloseHandle.argtypes = [wt.HANDLE]
+
+    kernel32.CreateProcessW.restype = wt.BOOL
+    kernel32.CreateProcessW.argtypes = [
+        wt.LPCWSTR,
+        wt.LPWSTR,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        wt.BOOL,
+        wt.DWORD,
+        ctypes.c_void_p,
+        wt.LPCWSTR,
+        ctypes.POINTER(_STARTUPINFOW),
+        ctypes.POINTER(_PROCESS_INFORMATION),
+    ]
+
+    kernel32.ResumeThread.restype = wt.DWORD
+    kernel32.ResumeThread.argtypes = [wt.HANDLE]
+
+    kernel32.TerminateProcess.restype = wt.BOOL
+    kernel32.TerminateProcess.argtypes = [wt.HANDLE, wt.UINT]
+
+    kernel32.WaitForSingleObject.restype = wt.DWORD
+    kernel32.WaitForSingleObject.argtypes = [wt.HANDLE, wt.DWORD]
+
+    kernel32.GetExitCodeProcess.restype = wt.BOOL
+    kernel32.GetExitCodeProcess.argtypes = [wt.HANDLE, ctypes.POINTER(wt.DWORD)]
+
+    kernel32.CreateFileW.restype = wt.HANDLE
+    kernel32.CreateFileW.argtypes = [
+        wt.LPCWSTR,
+        wt.DWORD,
+        wt.DWORD,
+        ctypes.POINTER(_SECURITY_ATTRIBUTES),
+        wt.DWORD,
+        wt.DWORD,
+        wt.HANDLE,
+    ]
+
+    kernel32.GetLastError.restype = wt.DWORD
+    kernel32.GetLastError.argtypes = []
+
     _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000
     _JOB_OBJECT_LIMIT_ACTIVE_PROCESS = 0x00000008
     _JOB_OBJECT_LIMIT_PROCESS_MEMORY = 0x00000100
@@ -213,10 +316,20 @@ if sys.platform == "win32":
 class WindowsJobObject:
     """
     Encapsulates a Windows Job Object for OS-level subprocess containment.
+
     Enforces:
-      - Kernel-enforced termination on job handle closure (no orphan processes).
-      - Active process count limits (mitigates fork-bombs and uncontrolled thread/process spawning).
-      - Hard committed memory limits (VirtualAlloc bounds preventing host memory starvation).
+      - Kernel-enforced termination of all descendant processes on job handle closure
+        or explicit job termination (prevents orphan processes and runaway trees).
+      - Active process count limits (limits concurrent child processes, mitigating
+        fork bombs; note: ActiveProcessLimit restricts process count, not thread count).
+      - Hard committed memory limits (sets per-process and per-job VirtualAlloc commit limits,
+        preventing host memory exhaustion).
+
+    Security Boundaries & Limitations:
+      - Windows Job Objects enforce resource quotas and process lifecycle containment.
+      - They DO NOT independently isolate the filesystem, network stack, or kernel IPC namespaces.
+      - This mechanism mitigates resource exhaustion but does NOT constitute a full sandbox
+        safe for arbitrary public untrusted code execution.
     """
 
     def __init__(
@@ -266,27 +379,34 @@ class WindowsJobObject:
 
         return self
 
-    def assign_process(self, proc: subprocess.Popen) -> None:
-        """Assigns the running subprocess to this Job Object."""
+    def assign_process(self, proc_or_handle: Any) -> None:
+        """Assigns a process (subprocess.Popen, WindowsProcess, or raw HANDLE) to this Job Object."""
         if not self._is_windows:
             return
 
         if not self.handle:
             raise RuntimeError("Windows Job Object is not active.")
 
-        if proc.poll() is not None:
+        raw_handle = getattr(proc_or_handle, "_handle", proc_or_handle)
+        if raw_handle is None:
+            raise RuntimeError("Process does not expose a native OS process handle.")
+
+        if hasattr(proc_or_handle, "poll") and proc_or_handle.poll() is not None:
             # Subprocess already exited; nothing left to contain
             return
 
-        raw_handle = getattr(proc, "_handle", None)
-        if raw_handle is None:
-            raise RuntimeError("Subprocess does not expose a native OS process handle.")
-
         kernel32 = ctypes.windll.kernel32
-        success = kernel32.AssignProcessToJobObject(self.handle, int(raw_handle))
+        if isinstance(raw_handle, wt.HANDLE):
+            h_proc = raw_handle
+        elif hasattr(raw_handle, "value") and raw_handle.value is not None:
+            h_proc = wt.HANDLE(raw_handle.value)
+        else:
+            h_proc = wt.HANDLE(int(raw_handle))
+
+        success = kernel32.AssignProcessToJobObject(self.handle, h_proc)
         if not success:
             # Check if process exited right during the call
-            if proc.poll() is not None:
+            if hasattr(proc_or_handle, "poll") and proc_or_handle.poll() is not None:
                 return
             err = kernel32.GetLastError()
             raise RuntimeError(f"Failed to assign process to Windows Job Object: error code {err}")
@@ -312,7 +432,183 @@ class WindowsJobObject:
         self.close()
 
 
-def _terminate_process_tree(proc: subprocess.Popen, job: Optional[WindowsJobObject] = None) -> None:
+class WindowsProcess:
+    """
+    Manages a native Windows process handle created via CreateProcessW in a suspended state.
+    Implements a subprocess.Popen-compatible interface for poll(), wait(), kill(), and terminate().
+    """
+
+    def __init__(self, h_process: Any, pid: int):
+        self._handle = h_process
+        self.pid = pid
+        self.returncode: Optional[int] = None
+
+    def poll(self) -> Optional[int]:
+        if self.returncode is not None:
+            return self.returncode
+        if not self._handle:
+            return self.returncode
+        status = kernel32.WaitForSingleObject(self._handle, 0)
+        if status == 0:  # WAIT_OBJECT_0
+            code = wt.DWORD()
+            if kernel32.GetExitCodeProcess(self._handle, ctypes.byref(code)):
+                self.returncode = int(code.value)
+            else:
+                self.returncode = 1
+            return self.returncode
+        return None
+
+    def wait(self, timeout: Optional[float] = None) -> int:
+        if self.returncode is not None:
+            return self.returncode
+        if not self._handle:
+            return self.returncode or 0
+
+        timeout_ms = wt.DWORD(int(timeout * 1000) if timeout is not None and timeout >= 0 else 0xFFFFFFFF)
+        status = kernel32.WaitForSingleObject(self._handle, timeout_ms)
+        if status == 0x00000102:  # WAIT_TIMEOUT
+            raise subprocess.TimeoutExpired(cmd=f"pid_{self.pid}", timeout=timeout)
+        elif status == 0:  # WAIT_OBJECT_0
+            code = wt.DWORD()
+            if kernel32.GetExitCodeProcess(self._handle, ctypes.byref(code)):
+                self.returncode = int(code.value)
+            else:
+                self.returncode = 1
+            return self.returncode
+        else:
+            err = kernel32.GetLastError()
+            raise RuntimeError(f"WaitForSingleObject failed with status {status}, error code {err}")
+
+    def terminate(self) -> None:
+        if self.poll() is None and self._handle:
+            kernel32.TerminateProcess(self._handle, 1)
+            self.poll()
+
+    def kill(self) -> None:
+        self.terminate()
+
+    def close(self) -> None:
+        if self._handle:
+            kernel32.CloseHandle(self._handle)
+            self._handle = None
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            pass
+
+
+def _spawn_suspended_windows_process(
+    cmd: List[str],
+    env: Dict[str, str],
+    job: Optional[WindowsJobObject] = None,
+    cwd: Optional[str] = None,
+) -> WindowsProcess:
+    """
+    Creates a child process in a genuinely suspended state on Windows,
+    assigns it to the configured Job Object, and resumes execution only
+    after assignment succeeds.
+
+    If creation, assignment, or resumption fails, the process is terminated,
+    all open handles are safely closed, and an exception is raised.
+    Never allows untrusted code to run outside the Job Object.
+    """
+    cmd_str = subprocess.list2cmdline(cmd)
+    cmd_buf = ctypes.create_unicode_buffer(cmd_str)
+
+    # Unicode environment block: sequence of null-terminated strings ending with double null
+    env_str = "".join(f"{k}={v}\0" for k, v in env.items()) + "\0"
+    env_buf = ctypes.create_unicode_buffer(env_str)
+
+    si = _STARTUPINFOW()
+    si.cb = ctypes.sizeof(si)
+    pi = _PROCESS_INFORMATION()
+
+    # Route standard handles to NUL with bInheritHandle=True so worker print/logging does not raise OSError
+    sa = _SECURITY_ATTRIBUTES()
+    sa.nLength = ctypes.sizeof(sa)
+    sa.bInheritHandle = True
+
+    h_nul = kernel32.CreateFileW(
+        "NUL",
+        0x80000000 | 0x40000000,  # GENERIC_READ | GENERIC_WRITE
+        0x00000001 | 0x00000002,  # FILE_SHARE_READ | FILE_SHARE_WRITE
+        ctypes.byref(sa),
+        3,  # OPEN_EXISTING
+        0,
+        None,
+    )
+    h_nul_valid = (
+        h_nul is not None
+        and h_nul != 0
+        and h_nul != wt.HANDLE(-1).value
+        and h_nul != -1
+    )
+
+    if h_nul_valid:
+        si.dwFlags |= 0x00000100  # STARTF_USESTDHANDLES
+        si.hStdInput = h_nul
+        si.hStdOutput = h_nul
+        si.hStdError = h_nul
+        b_inherit = True
+    else:
+        b_inherit = False
+
+    # CREATE_SUSPENDED (0x04) | CREATE_NEW_PROCESS_GROUP (0x200) | CREATE_NO_WINDOW (0x08000000) | CREATE_UNICODE_ENVIRONMENT (0x400)
+    flags = 0x00000004 | 0x00000200 | 0x08000000 | 0x00000400
+    cwd_buf = ctypes.create_unicode_buffer(cwd) if cwd else None
+
+    try:
+        success = kernel32.CreateProcessW(
+            None,
+            cmd_buf,
+            None,
+            None,
+            b_inherit,
+            flags,
+            ctypes.byref(env_buf),
+            cwd_buf,
+            ctypes.byref(si),
+            ctypes.byref(pi),
+        )
+    finally:
+        if h_nul_valid:
+            kernel32.CloseHandle(h_nul)
+
+    if not success:
+        err = kernel32.GetLastError()
+        raise RuntimeError(f"CreateProcessW failed: error code {err}")
+
+    h_proc = pi.hProcess
+    h_thread = pi.hThread
+    pid = int(pi.dwProcessId)
+
+    # Step 3: Assign suspended worker to configured Job Object
+    if job is not None and getattr(job, "handle", None):
+        try:
+            job.assign_process(h_proc)
+        except Exception as e:
+            # Terminate immediately before process ever runs
+            kernel32.TerminateProcess(h_proc, 1)
+            kernel32.CloseHandle(h_thread)
+            kernel32.CloseHandle(h_proc)
+            raise RuntimeError(f"Could not assign worker to Windows Job Object: {str(e)}") from e
+
+    # Step 4: Resume execution only after successful assignment
+    prev_suspend_count = kernel32.ResumeThread(h_thread)
+    kernel32.CloseHandle(h_thread)
+
+    if prev_suspend_count == 0xFFFFFFFF:
+        err = kernel32.GetLastError()
+        kernel32.TerminateProcess(h_proc, 1)
+        kernel32.CloseHandle(h_proc)
+        raise RuntimeError(f"Failed to resume suspended worker thread: error code {err}")
+
+    return WindowsProcess(h_proc, pid)
+
+
+def _terminate_process_tree(proc: Any, job: Optional[WindowsJobObject] = None) -> None:
     """
     Terminates the worker process and attempts to kill descendants across Windows and POSIX.
     Uses kernel Job Object termination on Windows when available.
@@ -323,27 +619,28 @@ def _terminate_process_tree(proc: subprocess.Popen, job: Optional[WindowsJobObje
         except Exception:
             pass
 
-    if proc.poll() is not None:
+    if hasattr(proc, "poll") and proc.poll() is not None:
         return
 
-    pid = proc.pid
-    if sys.platform == "win32":
-        try:
-            subprocess.run(
-                ["taskkill", "/F", "/T", "/PID", str(pid)],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                timeout=3.0,
-                check=False
-            )
-        except Exception:
-            pass
-    else:
-        try:
-            import signal
-            os.killpg(os.getpgid(pid), signal.SIGKILL)
-        except Exception:
-            pass
+    pid = getattr(proc, "pid", None)
+    if pid is not None:
+        if sys.platform == "win32":
+            try:
+                subprocess.run(
+                    ["taskkill", "/F", "/T", "/PID", str(pid)],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=3.0,
+                    check=False
+                )
+            except Exception:
+                pass
+        else:
+            try:
+                import signal
+                os.killpg(os.getpgid(pid), signal.SIGKILL)
+            except Exception:
+                pass
 
     try:
         proc.kill()
@@ -356,15 +653,28 @@ class SandboxExecutor:
     """
     Centralized execution orchestration engine for AI-generated pandas code.
     Shared across FastAPI (backend/main.py) and Streamlit (app.py).
+
     Enforces:
       - Admission constraints (code size, row/column counts, memory admission).
       - AST static code safety validation.
-      - Global concurrency limits with queue timeout and saturation rejection.
+      - Process-local concurrency limits via threading.BoundedSemaphore with queue timeout
+        and saturation rejection (Note: this coordinates execution strictly within the
+        current Python host process; it does not enforce machine-wide or multi-worker limits).
       - Ephemeral Arrow IPC and JSON envelope exchange with write-time budgets.
-      - OS-level containment (Windows Job Objects on Windows; process groups on POSIX).
+      - Race-free OS-level containment:
+          * On Windows: worker is created suspended (CREATE_SUSPENDED), assigned to a configured
+            Windows Job Object, and resumed only after assignment succeeds.
+          * On POSIX: isolated process groups (start_new_session=True).
       - Hard wall-clock timeout and process-tree termination.
       - Bounded numeric, string, collection, and response serialization limits.
       - Zero fallback to in-process execution.
+
+    Known Limitations:
+      - A disconnected HTTP client does not automatically abort synchronous execution already in progress.
+      - Windows Job Objects isolate CPU, committed memory, and process lifecycle; they do NOT
+        independently sandbox the filesystem, network stack, or kernel IPC namespaces.
+      - Not certified for public multi-tenant execution of arbitrary untrusted payloads without hypervisor
+        or container isolation.
     """
     _instance: Optional["SandboxExecutor"] = None
     _lock = threading.Lock()
@@ -533,41 +843,37 @@ class SandboxExecutor:
                 cmd = [sys.executable, "-u", str(WORKER_SCRIPT), "--ipc-dir", ipc_dir]
                 safe_env = _get_safe_env()
 
-                popen_kwargs: Dict[str, Any] = {
-                    "stdout": subprocess.DEVNULL,  # Discard worker stdout at OS kernel level
-                    "stderr": subprocess.DEVNULL,  # Discard worker stderr at OS kernel level; diagnostics in response.json
-                    "env": safe_env,
-                }
-
-                if sys.platform == "win32":
-                    popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
-                else:
-                    popen_kwargs["start_new_session"] = True
-
                 job = None
-                if sys.platform == "win32" and self.enable_job_object:
-                    try:
-                        job = WindowsJobObject(
-                            memory_limit_bytes=self.worker_memory_limit_bytes,
-                            max_processes=self.worker_process_limit,
-                        ).open()
-                    except Exception as e:
-                        return False, f"Execution setup failed: Could not configure Windows Job Object containment: {str(e)}"
+                if sys.platform == "win32":
+                    if self.enable_job_object:
+                        try:
+                            job = WindowsJobObject(
+                                memory_limit_bytes=self.worker_memory_limit_bytes,
+                                max_processes=self.worker_process_limit,
+                            ).open()
+                        except Exception as e:
+                            return False, f"Execution setup failed: Could not configure Windows Job Object containment: {str(e)}"
 
-                try:
-                    proc = subprocess.Popen(cmd, **popen_kwargs)
-                except Exception as e:
-                    if job is not None:
-                        job.close()
-                    return False, f"Execution failed: Could not launch worker process: {str(e)}"
-
-                if sys.platform == "win32" and job is not None:
                     try:
-                        job.assign_process(proc)
+                        proc = _spawn_suspended_windows_process(cmd, safe_env, job=job)
                     except Exception as e:
-                        _terminate_process_tree(proc, job=job)
-                        job.close()
-                        return False, f"Execution failed: Could not assign worker to Windows Job Object: {str(e)}"
+                        if job is not None:
+                            job.close()
+                        err_msg = str(e)
+                        if "could not assign worker to windows job object" in err_msg.lower():
+                            return False, f"Execution failed: {err_msg}"
+                        return False, f"Execution failed: Could not launch worker process: {err_msg}"
+                else:
+                    popen_kwargs: Dict[str, Any] = {
+                        "stdout": subprocess.DEVNULL,  # Discard worker stdout at OS kernel level
+                        "stderr": subprocess.DEVNULL,  # Discard worker stderr at OS kernel level; diagnostics in response.json
+                        "env": safe_env,
+                        "start_new_session": True,
+                    }
+                    try:
+                        proc = subprocess.Popen(cmd, **popen_kwargs)
+                    except Exception as e:
+                        return False, f"Execution failed: Could not launch worker process: {str(e)}"
 
                 # 4. Wait for execution under hard wall-clock deadline
                 try:
@@ -582,6 +888,8 @@ class SandboxExecutor:
                 finally:
                     if job is not None:
                         job.close()
+                    if hasattr(proc, "close"):
+                        proc.close()
 
                 # 5. Process exit verification and error diagnostic handling
                 if proc.returncode != 0:

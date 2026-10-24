@@ -1111,3 +1111,281 @@ def test_both_fastapi_and_streamlit_use_shared_executor():
     # Verify identical SandboxExecutor class reference
     assert backend_main.SandboxExecutor is sandbox.SandboxExecutor
     assert streamlit_app.SandboxExecutor is sandbox.SandboxExecutor
+
+
+def test_win32_ctypes_declarations_and_pointer_sizes():
+    """Verify Win32 ctypes declarations, parameter types, restypes, and pointer-sized handles."""
+    if sys.platform != "win32":
+        pytest.skip("Windows-specific ctypes declaration verification")
+
+    import ctypes
+    import ctypes.wintypes as wt
+
+    kernel32 = ctypes.windll.kernel32
+
+    # Verify pointer-sized HANDLE
+    assert ctypes.sizeof(wt.HANDLE) == ctypes.sizeof(ctypes.c_void_p)
+
+    # Verify function signatures are explicitly registered
+    assert kernel32.CreateJobObjectW.restype == wt.HANDLE
+    assert kernel32.CreateJobObjectW.argtypes == [ctypes.c_void_p, wt.LPCWSTR]
+
+    assert kernel32.SetInformationJobObject.restype == wt.BOOL
+    assert len(kernel32.SetInformationJobObject.argtypes) == 4
+
+    assert kernel32.AssignProcessToJobObject.restype == wt.BOOL
+    assert kernel32.AssignProcessToJobObject.argtypes == [wt.HANDLE, wt.HANDLE]
+
+    assert kernel32.TerminateJobObject.restype == wt.BOOL
+    assert kernel32.TerminateJobObject.argtypes == [wt.HANDLE, wt.UINT]
+
+    assert kernel32.CloseHandle.restype == wt.BOOL
+    assert kernel32.CloseHandle.argtypes == [wt.HANDLE]
+
+    assert kernel32.CreateProcessW.restype == wt.BOOL
+    assert len(kernel32.CreateProcessW.argtypes) == 10
+
+    assert kernel32.ResumeThread.restype == wt.DWORD
+    assert kernel32.ResumeThread.argtypes == [wt.HANDLE]
+
+    assert kernel32.TerminateProcess.restype == wt.BOOL
+    assert kernel32.TerminateProcess.argtypes == [wt.HANDLE, wt.UINT]
+
+    assert kernel32.WaitForSingleObject.restype == wt.DWORD
+    assert kernel32.WaitForSingleObject.argtypes == [wt.HANDLE, wt.DWORD]
+
+    assert kernel32.GetExitCodeProcess.restype == wt.BOOL
+    assert kernel32.GetExitCodeProcess.argtypes == [wt.HANDLE, ctypes.POINTER(wt.DWORD)]
+
+
+def test_windows_kernel_descendant_termination_integration(tmp_path):
+    """
+    [REAL WINDOWS KERNEL INTEGRATION TEST]
+    Exercises real Windows kernel behavior:
+    Starts a worker inside a WindowsJobObject with KILL_ON_JOB_CLOSE.
+    The worker creates a grandchild process.
+    When the Job Object is terminated or closed, the Windows kernel terminates
+    both the worker and all grandchild descendants.
+    """
+    if sys.platform != "win32":
+        pytest.skip("Windows-only kernel integration test")
+
+    import ctypes
+    import ctypes.wintypes as wt
+    import time
+
+    kernel32 = ctypes.windll.kernel32
+
+    pid_file = tmp_path / "grandchild.pid"
+    posix_pid = pid_file.as_posix()
+
+    job = WindowsJobObject().open()
+    assert job.handle is not None
+
+    worker_code = (
+        "import subprocess, sys, time\n"
+        f"p = subprocess.Popen([sys.executable, '-c', 'import os, time; open(\"{posix_pid}\", \"w\").write(str(os.getpid())); time.sleep(30)'])\n"
+        "time.sleep(30)\n"
+    )
+
+    proc = sandbox._spawn_suspended_windows_process(
+        [sys.executable, "-c", worker_code],
+        env=sandbox._get_safe_env(),
+        job=job,
+    )
+
+    # Wait for grandchild PID to be written
+    grandchild_pid = None
+    for _ in range(50):
+        if pid_file.exists() and pid_file.stat().st_size > 0:
+            grandchild_pid = int(pid_file.read_text().strip())
+            break
+        time.sleep(0.1)
+
+    assert grandchild_pid is not None, "Grandchild did not start in time"
+
+    # Open handle to grandchild with SYNCHRONIZE rights
+    SYNCHRONIZE = 0x00100000
+    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+    kernel32.OpenProcess.restype = wt.HANDLE
+    kernel32.OpenProcess.argtypes = [wt.DWORD, wt.BOOL, wt.DWORD]
+
+    h_grandchild = kernel32.OpenProcess(SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, False, grandchild_pid)
+    assert h_grandchild is not None and h_grandchild != 0
+
+    try:
+        # Terminate Job Object and close handle
+        job.terminate(1)
+        job.close()
+
+        # Grandchild process MUST be signaled as terminated by OS kernel
+        wait_res = kernel32.WaitForSingleObject(h_grandchild, 5000)
+        assert wait_res == 0, "Grandchild process survived Job Object termination!"
+    finally:
+        kernel32.CloseHandle(h_grandchild)
+        proc.close()
+
+
+def test_windows_kernel_memory_limit_enforcement_integration():
+    """
+    [REAL WINDOWS KERNEL INTEGRATION TEST]
+    Exercises real Windows kernel memory quota enforcement:
+    Configures a WindowsJobObject with a bounded 64 MiB limit.
+    Launches a worker that attempts to allocate 150 MiB.
+    Verifies that the OS kernel rejects memory commitment above the Job limit.
+    """
+    if sys.platform != "win32":
+        pytest.skip("Windows-only kernel integration test")
+
+    # 64 MiB limit
+    job = WindowsJobObject(memory_limit_bytes=64 * 1024 * 1024, max_processes=4).open()
+    assert job.handle is not None
+
+    alloc_code = (
+        "import sys\n"
+        "try:\n"
+        "    data = bytearray(150 * 1024 * 1024)\n"
+        "    sys.exit(0)\n"
+        "except MemoryError:\n"
+        "    sys.exit(42)\n"
+        "except Exception:\n"
+        "    sys.exit(43)\n"
+    )
+
+    try:
+        proc = sandbox._spawn_suspended_windows_process(
+            [sys.executable, "-c", alloc_code],
+            env=sandbox._get_safe_env(),
+            job=job,
+        )
+        exit_code = proc.wait(timeout=5.0)
+        # Allocation must NOT succeed: exit code 42 (MemoryError) or abnormal OS termination
+        assert exit_code != 0, "Worker unexpectedly succeeded in committing memory beyond Job limit"
+    finally:
+        job.close()
+        proc.close()
+
+
+def test_windows_kernel_active_process_limit_enforcement_integration(tmp_path):
+    """
+    [REAL WINDOWS KERNEL INTEGRATION TEST]
+    Exercises real Windows kernel active process limit enforcement:
+    Configures a WindowsJobObject with ActiveProcessLimit = 2.
+    Spawns a worker that creates 1 child (total active = 2).
+    Attempting to spawn a 2nd child (reaching 3) is rejected by the OS kernel with quota error.
+    """
+    if sys.platform != "win32":
+        pytest.skip("Windows-only kernel integration test")
+
+    job = WindowsJobObject(memory_limit_bytes=256 * 1024 * 1024, max_processes=2).open()
+    assert job.handle is not None
+
+    err_file = tmp_path / "quota_err.txt"
+    base_exe = getattr(sys, "_base_executable", sys.executable)
+
+    worker_code = (
+        "import subprocess, sys, time\n"
+        f"base = r'{base_exe}'\n"
+        "p1 = subprocess.Popen([base, '-c', 'import time; time.sleep(10)'])\n"
+        "try:\n"
+        "    p2 = subprocess.Popen([base, '-c', 'import time; time.sleep(10)'])\n"
+        "    sys.exit(0)\n"
+        "except OSError as e:\n"
+        f"    open(r'{err_file}', 'w').write(str(e))\n"
+        "    sys.exit(99)\n"
+        "finally:\n"
+        "    p1.kill()\n"
+    )
+
+    try:
+        proc = sandbox._spawn_suspended_windows_process(
+            [base_exe, "-c", worker_code],
+            env=sandbox._get_safe_env(),
+            job=job,
+        )
+        exit_code = proc.wait(timeout=6.0)
+        assert exit_code == 99, f"Worker returned unexpected code {exit_code}"
+        assert err_file.exists(), "Quota error file was not created"
+        err_content = err_file.read_text()
+        assert "1816" in err_content or "quota" in err_content.lower()
+    finally:
+        job.close()
+        proc.close()
+
+
+def test_windows_suspended_startup_ordering_prevents_pre_containment_execution(tmp_path):
+    """
+    [REGRESSION TEST - STARTUP ORDERING]
+    Demonstrates that the worker process cannot execute user code prior to Job Object assignment.
+    Creates a process in a suspended state; simulates assignment failure before resumption.
+    Verifies that the worker is terminated without ever executing, and the marker file is never created.
+    """
+    if sys.platform != "win32":
+        pytest.skip("Windows-only startup ordering test")
+
+    import ctypes
+    import ctypes.wintypes as wt
+
+    marker_file = tmp_path / "startup_marker.txt"
+    assert not marker_file.exists()
+    posix_marker = marker_file.as_posix()
+
+    cmd = [sys.executable, "-c", f"open('{posix_marker}', 'w').write('executed'); import sys; sys.exit(0)"]
+
+    job = WindowsJobObject().open()
+    job.handle = wt.HANDLE(0x12345)  # Simulate invalid/failing Job handle for assignment
+
+    with pytest.raises(RuntimeError) as exc_info:
+        sandbox._spawn_suspended_windows_process(cmd, env=sandbox._get_safe_env(), job=job)
+
+    assert "could not assign worker to windows job object" in str(exc_info.value).lower()
+    # Critically: because the worker was suspended, it NEVER executed before assignment failure!
+    assert not marker_file.exists(), "Worker executed user code before successful Job Object assignment!"
+
+
+def test_windows_suspended_startup_resume_failure_fails_closed(monkeypatch):
+    """
+    [FAILURE PATH TEST - MOCKED RESUMETHREAD]
+    Verifies that if ResumeThread fails, the process is safely terminated,
+    handles are cleaned, and an error is raised without leaving unmanaged processes running.
+    """
+    if sys.platform != "win32":
+        pytest.skip("Windows-only resume failure test")
+
+    import ctypes
+    kernel32 = ctypes.windll.kernel32
+
+    # Mock ResumeThread to simulate failure (0xFFFFFFFF)
+    monkeypatch.setattr(kernel32, "ResumeThread", lambda handle: 0xFFFFFFFF)
+
+    job = WindowsJobObject().open()
+    cmd = [sys.executable, "-c", "import sys; sys.exit(0)"]
+
+    try:
+        with pytest.raises(RuntimeError) as exc_info:
+            sandbox._spawn_suspended_windows_process(cmd, env=sandbox._get_safe_env(), job=job)
+        assert "failed to resume suspended worker thread" in str(exc_info.value).lower()
+    finally:
+        job.close()
+
+
+def test_windows_job_object_set_information_failure_cleans_handles(monkeypatch):
+    """
+    [FAILURE PATH TEST - MOCKED SETINFORMATIONJOBOBJECT]
+    Verifies that if SetInformationJobObject fails during open(), the handle is closed
+    and self.handle is set to None.
+    """
+    if sys.platform != "win32":
+        pytest.skip("Windows-only SetInformationJobObject test")
+
+    import ctypes
+    kernel32 = ctypes.windll.kernel32
+
+    monkeypatch.setattr(kernel32, "SetInformationJobObject", lambda *args: False)
+
+    job = WindowsJobObject()
+    with pytest.raises(RuntimeError) as exc_info:
+        job.open()
+
+    assert "failed to configure windows job object limits" in str(exc_info.value).lower()
+    assert job.handle is None, "Job handle was not cleaned up after configuration failure!"
