@@ -1,0 +1,93 @@
+name: Sandbox Native Linux Docker Validation
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - "sandbox.py"
+      - "sandbox_worker.py"
+      - "validator.py"
+      - "Dockerfile.sandbox"
+      - "requirements.txt"
+      - "tests/test_sandbox.py"
+      - ".github/workflows/sandbox-linux-validation.yml"
+  pull_request:
+    branches:
+      - main
+    paths:
+      - "sandbox.py"
+      - "sandbox_worker.py"
+      - "validator.py"
+      - "Dockerfile.sandbox"
+      - "requirements.txt"
+      - "tests/test_sandbox.py"
+      - ".github/workflows/sandbox-linux-validation.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  validate-docker-sandbox:
+    name: Native Linux Docker Integration
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Verify Docker daemon availability
+        run: |
+          docker version
+          docker info --format 'Storage Driver: {{.DriverStatus}}'
+
+      - name: Build sandbox container image
+        run: |
+          docker build -t ai-data-analyst-sandbox:latest -f Dockerfile.sandbox .
+          docker image inspect ai-data-analyst-sandbox:latest --format 'Verified Image ID: {{.Id}}'
+
+      - name: Run real Docker sandbox integration tests
+        run: |
+          set -eo pipefail
+          output_log=$(mktemp)
+
+          python -m pytest tests/test_sandbox.py \
+            -k "test_docker_real_container_network_isolation_integration or test_docker_real_container_read_only_rootfs_integration or test_docker_real_container_timeout_and_cleanup_integration" \
+            -v -rA --durations=0 | tee "$output_log"
+
+          # 1. Enforce zero skips: on a live Linux runner with Docker, integration tests must NEVER be skipped
+          if grep -E "([1-9][0-9]* skipped|SKIPPED)" "$output_log"; then
+            echo "::error::Real Docker integration tests were skipped on native Linux runner!"
+            exit 1
+          fi
+
+          # 2. Enforce exact pass count: all 3 real integration tests must execute and pass
+          if ! grep -E "3 passed" "$output_log"; then
+            echo "::error::Expected exactly 3 real Docker integration tests to pass!"
+            exit 1
+          fi
+
+      - name: Verify zero lingering sandbox containers
+        if: always()
+        run: |
+          lingering=$(docker ps -a --filter "name=sandbox_worker_" --format "{{.ID}} {{.Names}} {{.Status}}")
+          if [ -n "$lingering" ]; then
+            echo "::error::Lingering sandbox containers detected:"
+            echo "$lingering"
+            docker rm -f $(docker ps -a -q --filter "name=sandbox_worker_")
+            exit 1
+          fi
+          echo "Confirmed: zero lingering sandbox containers."
