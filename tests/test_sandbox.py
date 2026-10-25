@@ -1818,62 +1818,164 @@ def test_docker_cleanup_helper_tolerates_missing_container():
     not sandbox._is_docker_available(),
     reason="[REAL DOCKER KERNEL INTEGRATION TEST] Requires Docker daemon and container image"
 )
-def test_docker_real_container_network_isolation_integration(sample_df):
+def test_docker_real_container_network_isolation_integration(sample_df, monkeypatch):
     """
     [REAL LINUX / DOCKER INTEGRATION TEST]
-    Validates that --network none blocks all outbound network socket connections.
+    Validates that --network none blocks all outbound network socket connections at the kernel level.
     """
+    # Scope AST bypass to this integration test to verify Layer 3 (Docker containment)
+    monkeypatch.setattr(sandbox, "validate_code", lambda c: (True, ""))
+
+    # Spy on container invocation to verify Docker execution path is reached
+    docker_invocations = []
+    orig_build = sandbox._build_docker_cmd
+
+    def spy_build(*args, **kwargs):
+        cmd, name = orig_build(*args, **kwargs)
+        docker_invocations.append((cmd, name))
+        return cmd, name
+
+    monkeypatch.setattr(sandbox, "_build_docker_cmd", spy_build)
+
+    # Use pd.read_csv targeting an external numeric IP without DNS to isolate kernel network routing.
+    # Under Linux with --network none, the kernel refuses the connect syscall with ENETUNREACH (Errno 101).
     code = (
-        "import urllib.request\n"
         "try:\n"
-        "    urllib.request.urlopen('http://1.1.1.1', timeout=1.0)\n"
+        "    pd.read_csv('http://1.1.1.1:8080/data.csv')\n"
         "    result = 'CONNECTED'\n"
         "except Exception as e:\n"
-        "    result = f'BLOCKED: {type(e).__name__}'\n"
+        "    result = {\n"
+        "        'status': 'BLOCKED',\n"
+        "        'exception_type': type(e).__name__,\n"
+        "        'message': str(e),\n"
+        "    }\n"
     )
     executor = SandboxExecutor(backend="docker")
     success, res = executor.execute(code, sample_df)
-    assert success is True
-    assert "BLOCKED" in str(res)
+
+    # Verify real Docker invocation occurred with --network none
+    assert len(docker_invocations) == 1, "Docker container command was not built"
+    cmd_args = docker_invocations[0][0]
+    assert "--network" in cmd_args and "none" in cmd_args
+
+    # Verify container executed and returned structured error from network namespace block
+    assert success is True, f"Execution failed unexpectedly: {res}"
+    assert isinstance(res, dict)
+    assert res.get("status") == "BLOCKED"
+    assert res.get("exception_type") in ("URLError", "OSError")
+    msg = res.get("message", "").lower()
+    # Confirm failure is specifically due to unreachable network, not DNS failure or application error
+    assert any(term in msg for term in ["network is unreachable", "101", "unreachable", "errno 101"]), (
+        f"Unexpected error reason (expected network unreachable): {res.get('message')}"
+    )
 
 
 @pytest.mark.skipif(
     not sandbox._is_docker_available(),
     reason="[REAL DOCKER KERNEL INTEGRATION TEST] Requires Docker daemon and container image"
 )
-def test_docker_real_container_read_only_rootfs_integration(sample_df):
+def test_docker_real_container_read_only_rootfs_integration(sample_df, monkeypatch):
     """
     [REAL LINUX / DOCKER INTEGRATION TEST]
     Validates that --read-only prevents writes to the container root filesystem.
     """
+    # Scope AST bypass to this integration test to verify Layer 3 (Docker containment)
+    monkeypatch.setattr(sandbox, "validate_code", lambda c: (True, ""))
+
+    # Spy on container invocation to verify Docker execution path is reached
+    docker_invocations = []
+    orig_build = sandbox._build_docker_cmd
+
+    def spy_build(*args, **kwargs):
+        cmd, name = orig_build(*args, **kwargs)
+        docker_invocations.append((cmd, name))
+        return cmd, name
+
+    monkeypatch.setattr(sandbox, "_build_docker_cmd", spy_build)
+
+    # Write to a path on the container's read-only root filesystem outside writable mounts (/workspace/ipc/out, /tmp)
     code = (
         "try:\n"
-        "    with open('/workspace/malicious.txt', 'w') as f:\n"
-        "        f.write('pwned')\n"
+        "    pd.DataFrame({'a': [1]}).to_csv('/workspace/malicious.txt')\n"
         "    result = 'WRITTEN'\n"
-        "except OSError as e:\n"
-        "    result = f'READ_ONLY: {type(e).__name__}'\n"
+        "except Exception as e:\n"
+        "    result = {\n"
+        "        'status': 'READ_ONLY',\n"
+        "        'exception_type': type(e).__name__,\n"
+        "        'message': str(e),\n"
+        "    }\n"
     )
     executor = SandboxExecutor(backend="docker")
     success, res = executor.execute(code, sample_df)
-    assert success is True
-    assert "READ_ONLY" in str(res)
+
+    # Verify real Docker invocation occurred with --read-only
+    assert len(docker_invocations) == 1, "Docker container command was not built"
+    cmd_args = docker_invocations[0][0]
+    assert "--read-only" in cmd_args
+
+    # Verify container executed and returned OS-level write failure
+    assert success is True, f"Execution failed unexpectedly: {res}"
+    assert isinstance(res, dict)
+    assert res.get("status") == "READ_ONLY"
+    assert res.get("exception_type") == "OSError"
+    msg = res.get("message", "").lower()
+    # Confirm failure is specifically due to read-only filesystem (EROFS / Errno 30)
+    assert any(term in msg for term in ["read-only file system", "errno 30", "erofs"]), (
+        f"Unexpected error reason (expected read-only filesystem): {res.get('message')}"
+    )
 
 
 @pytest.mark.skipif(
     not sandbox._is_docker_available(),
     reason="[REAL DOCKER KERNEL INTEGRATION TEST] Requires Docker daemon and container image"
 )
-def test_docker_real_container_timeout_and_cleanup_integration(sample_df):
+def test_docker_real_container_timeout_and_cleanup_integration(sample_df, monkeypatch):
     """
     [REAL LINUX / DOCKER INTEGRATION TEST]
     Validates that a runaway container is forcefully terminated and destroyed within timeout.
     """
+    import time
+
+    # Scope AST bypass to this integration test to verify Layer 3 (Docker containment)
+    monkeypatch.setattr(sandbox, "validate_code", lambda c: (True, ""))
+
+    # Spy on container invocation to capture container name and verify execution
+    docker_invocations = []
+    orig_build = sandbox._build_docker_cmd
+
+    def spy_build(*args, **kwargs):
+        cmd, name = orig_build(*args, **kwargs)
+        docker_invocations.append((cmd, name))
+        return cmd, name
+
+    monkeypatch.setattr(sandbox, "_build_docker_cmd", spy_build)
+
     code = "while True: pass"
     executor = SandboxExecutor(backend="docker")
+    start_time = time.monotonic()
     success, error_msg = executor.execute(code, sample_df, timeout_seconds=2.0)
+    elapsed = time.monotonic() - start_time
+
+    # Verify real Docker invocation occurred
+    assert len(docker_invocations) == 1, "Docker container command was not built"
+    container_name = docker_invocations[0][1]
+
+    # Verify timeout was enforced and took at least the configured deadline
+    assert elapsed >= 1.8, f"Execution completed prematurely ({elapsed:.2f}s), did not wait for timeout"
     assert success is False
     assert "timed out" in error_msg.lower()
+
+    # Verify container cleanup from Docker daemon (named container must not linger)
+    inspect_proc = subprocess.run(
+        ["docker", "ps", "-a", "--filter", f"name={container_name}", "--format", "{{.Names}}"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=False,
+    )
+    assert container_name not in inspect_proc.stdout.split(), (
+        f"Container {container_name} still exists in docker ps -a after timeout cleanup: {inspect_proc.stdout}"
+    )
 
 
 # =========================================================================
