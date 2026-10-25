@@ -15,7 +15,7 @@ permissions:
 jobs:
   test:
     name: Unit & Integration Tests
-    runs-on: ubuntu-latest
+    runs-on: windows-latest
     timeout-minutes: 10
 
     steps:
