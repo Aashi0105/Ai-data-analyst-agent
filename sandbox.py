@@ -14,6 +14,7 @@ import sys
 import os
 import io
 import json
+import re
 import tempfile
 import subprocess
 import threading
@@ -750,11 +751,82 @@ def _is_docker_available() -> bool:
         return False
 
 
+def _parse_docker_user(user_str: str) -> Tuple[int, Optional[int]]:
+    """
+    Parses and validates a container user identity string.
+    Accepts:
+      - 'uid' (e.g. '1000' -> returns (1000, None))
+      - 'uid:gid' (e.g. '1000:1000' -> returns (1000, 1000))
+
+    Rejects negative numbers, non-digit strings, empty values, or malformed formats with ValueError.
+    """
+    if not isinstance(user_str, str) or not user_str.strip():
+        raise ValueError("Container user identity cannot be empty.")
+
+    cleaned = user_str.strip()
+    if ":" in cleaned:
+        parts = cleaned.split(":")
+        if len(parts) != 2:
+            raise ValueError(
+                f"Malformed container user '{user_str}': expected 'uid' or 'uid:gid' (e.g., '1000' or '1000:1000')."
+            )
+        u_str, g_str = parts[0].strip(), parts[1].strip()
+        if not (u_str.isdigit() and g_str.isdigit()):
+            raise ValueError(
+                f"Malformed container user '{user_str}': UID and GID must be non-negative integers."
+            )
+        return int(u_str), int(g_str)
+    else:
+        if not cleaned.isdigit():
+            raise ValueError(
+                f"Malformed container user '{user_str}': UID must be a non-negative integer."
+            )
+        return int(cleaned), None
+
+
+def _get_docker_user() -> str:
+    """
+    Determines the container execution identity (--user) on Linux.
+
+    Security & Isolation Principle:
+      - If SANDBOX_DOCKER_USER is set in the environment, validates and uses that explicit mapping.
+      - On POSIX hosts where the host process is non-root (os.getuid() != 0):
+        Derives container identity directly from host identity: f"{os.getuid()}:{os.getgid()}".
+        * Why this is secure: Inside the container, this user is completely unprivileged.
+          --cap-drop ALL drops all capabilities, --security-opt no-new-privileges:true prevents
+          gaining privileges, and the container rootfs is --read-only.
+        * Why this solves IPC permissions: The container worker and host process share the
+          same UID/GID. Both in_dir and out_dir can remain strictly 0o700 owned by the host user.
+          Zero world-writable permissions (no 0o777, no 0o1777), zero chown/ACL dependencies,
+          and host cleanup via shutil.rmtree works natively without permission errors.
+      - On POSIX hosts where the host process is root (os.getuid() == 0):
+        Falls back to dedicated unprivileged user "10001:10001" (defined in Dockerfile.sandbox).
+        The host root process can safely configure 0o700 ownership for UID 10001 and clean up.
+      - On Windows hosts: defaults to "10001:10001".
+    """
+    env_user = os.environ.get("SANDBOX_DOCKER_USER", "").strip()
+    if env_user:
+        _parse_docker_user(env_user)
+        return env_user
+
+    if sys.platform != "win32" and hasattr(os, "getuid") and hasattr(os, "getgid"):
+        try:
+            uid = os.getuid()
+            gid = os.getgid()
+            if uid != 0:
+                return f"{uid}:{gid}"
+        except Exception:
+            pass
+
+    return "10001:10001"
+
+
 def _build_docker_cmd(
     in_dir: str,
     out_dir: str,
     image_name: str = DOCKER_SANDBOX_IMAGE,
     container_name: Optional[str] = None,
+    container_user: Optional[str] = None,
     memory_limit: str = "512m",
     cpu_limit: str = "1.0",
     pids_limit: int = 16,
@@ -766,7 +838,7 @@ def _build_docker_cmd(
       - --read-only: Read-only container root filesystem.
       - --cap-drop ALL: All Linux capabilities dropped.
       - --security-opt no-new-privileges:true: Prevents gaining privileges.
-      - --user 10001:10001: Unprivileged non-root user.
+      - --user: Unprivileged user derived safely via _get_docker_user().
       - --memory and --memory-swap: Strict memory limit with swap disabled.
       - --cpus: CPU quota enforcement.
       - --pids-limit: Process table limit preventing fork bombs.
@@ -774,10 +846,13 @@ def _build_docker_cmd(
       - -v in_dir:/workspace/ipc/in:ro: Input files mounted strictly READ-ONLY.
       - -v out_dir:/workspace/ipc/out:rw: Output files mounted in narrowly scoped writable directory.
       - --stop-timeout: Container stop timeout matching execution deadline.
+      - --pull=never: Strict fail-closed local image pinning preventing registry pulls.
       - --rm: Automatic removal on exit.
     """
     if not container_name:
         container_name = f"sandbox_worker_{uuid.uuid4().hex[:16]}"
+    if not container_user:
+        container_user = _get_docker_user()
 
     abs_in = os.path.abspath(in_dir)
     abs_out = os.path.abspath(out_dir)
@@ -796,7 +871,7 @@ def _build_docker_cmd(
         "--security-opt",
         "no-new-privileges:true",
         "--user",
-        "10001:10001",
+        container_user,
         f"--memory={memory_limit}",
         f"--memory-swap={memory_limit}",
         f"--cpus={cpu_limit}",
@@ -808,10 +883,8 @@ def _build_docker_cmd(
         "-v",
         f"{abs_out}:/workspace/ipc/out:rw",
         f"--stop-timeout={max(1, int(timeout_seconds))}",
+        "--pull=never",
         image_name,
-        "python",
-        "-u",
-        "/workspace/sandbox_worker.py",
         "--in-dir",
         "/workspace/ipc/in",
         "--out-dir",
@@ -820,28 +893,205 @@ def _build_docker_cmd(
     return cmd, container_name
 
 
-def _kill_and_remove_docker_container(container_name: str) -> None:
-    """Best-effort termination and removal of an isolated Docker worker container."""
+def _kill_and_remove_docker_container(container_name: str) -> Tuple[bool, str]:
+    """
+    Best-effort termination and removal of an isolated Docker worker container.
+    Returns (success, diagnostic_message). Never raises exceptions.
+    """
+    errs = []
     try:
-        subprocess.run(
+        res_kill = subprocess.run(
             ["docker", "kill", container_name],
             stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
             timeout=5.0,
             check=False,
+            text=True,
         )
-    except Exception:
-        pass
+        if res_kill.returncode != 0 and res_kill.stderr:
+            errs.append(res_kill.stderr.strip())
+    except Exception as e:
+        errs.append(f"docker kill error: {str(e)}")
+
     try:
-        subprocess.run(
+        res_rm = subprocess.run(
             ["docker", "rm", "-f", container_name],
             stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
             timeout=5.0,
             check=False,
+            text=True,
         )
-    except Exception:
-        pass
+        if res_rm.returncode != 0 and res_rm.stderr:
+            errs.append(res_rm.stderr.strip())
+    except Exception as e:
+        errs.append(f"docker rm error: {str(e)}")
+
+    return (len(errs) == 0, "; ".join(errs))
+
+
+def _setup_ipc_mount_permissions(
+    ipc_dir: str,
+    in_dir: str,
+    out_dir: str,
+    container_user: Optional[str] = None,
+) -> None:
+    """
+    Configures secure, least-privilege POSIX permissions for ephemeral container IPC mounts.
+
+    Security Boundaries:
+      1. Parent ipc_dir: Restricted to host owner only (0o700) so no other host user can traverse.
+      2. in_dir: Restricted to 0o700 (or 0o755 if container runs as distinct UID), mounted :ro inside container.
+         Input files: set to 0o600 (or 0o644 if distinct UID).
+      3. out_dir: Configured so that the unprivileged container worker can write its outputs:
+         - Case A (Aligned unprivileged identity): When container_user matches host UID (normal non-root host),
+           out_dir is set to strict 0o700 owned by the host process. No chmod 777, no ACL, no chown!
+         - Case B (Host root): When host runs as root (UID 0) and container is unprivileged (e.g. 10001:10001),
+           host root chowns out_dir to the target UID/GID and sets mode 0o700.
+         - Case C (Mismatched unprivileged identity): If host UID != 0 and container_user does not match
+           host UID, checks if safe ownership can be set (via chown or setfacl). If not possible without
+           permissive world-writable modes, FAILS CLOSED with a clear diagnostic instead of using 0o777/0o1777.
+
+    On Windows hosts (sys.platform == 'win32'), this operation is a safe no-op.
+    """
+    if sys.platform == "win32":
+        return
+
+    if not container_user:
+        container_user = _get_docker_user()
+
+    host_uid = os.getuid() if hasattr(os, "getuid") else None
+    host_gid = os.getgid() if hasattr(os, "getgid") else None
+
+    # Parse and validate container UID and GID (accepts 'uid' or 'uid:gid')
+    target_uid, target_gid = _parse_docker_user(container_user)
+
+    try:
+        # 1. Enforce strict parent directory isolation
+        os.chmod(ipc_dir, 0o700)
+
+        # 2. Case A: Host process and container worker share the same UID
+        if host_uid is not None and target_uid == host_uid:
+            os.chmod(in_dir, 0o700)
+            for entry in os.listdir(in_dir):
+                entry_path = os.path.join(in_dir, entry)
+                if os.path.isfile(entry_path):
+                    os.chmod(entry_path, 0o600)
+            os.chmod(out_dir, 0o700)
+            return
+
+        # 3. Case B: Host process is root (UID 0) and container is unprivileged
+        if host_uid == 0 and target_uid is not None:
+            os.chmod(in_dir, 0o755)
+            for entry in os.listdir(in_dir):
+                entry_path = os.path.join(in_dir, entry)
+                if os.path.isfile(entry_path):
+                    os.chmod(entry_path, 0o644)
+            effective_gid = target_gid if target_gid is not None else target_uid
+            os.chown(out_dir, target_uid, effective_gid)
+            os.chmod(out_dir, 0o700)
+            return
+
+        # 4. Case C: Mismatched unprivileged identity
+        effective_gid = target_gid if target_gid is not None else target_uid
+        chown_ok = False
+        if hasattr(os, "chown") and target_uid is not None:
+            try:
+                os.chown(out_dir, target_uid, effective_gid)
+                os.chmod(out_dir, 0o700)
+                chown_ok = True
+            except (PermissionError, OSError):
+                chown_ok = False
+
+        if not chown_ok and target_uid is not None:
+            import shutil
+            setfacl_bin = shutil.which("setfacl")
+            if setfacl_bin:
+                res = subprocess.run(
+                    [setfacl_bin, "-m", f"u:{target_uid}:rwx", out_dir],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=2.0,
+                    check=False,
+                )
+                if res.returncode == 0:
+                    os.chmod(out_dir, 0o750)
+                    os.chmod(in_dir, 0o755)
+                    for entry in os.listdir(in_dir):
+                        entry_path = os.path.join(in_dir, entry)
+                        if os.path.isfile(entry_path):
+                            os.chmod(entry_path, 0o644)
+                    return
+
+        if not chown_ok:
+            # Strictly reject insecure fallback (no 0o777 / 0o1777)
+            raise RuntimeError(
+                f"Cannot establish secure, non-permissive IPC mount permissions between host UID {host_uid} "
+                f"and container user '{container_user}'. Run host unprivileged with matching container user, "
+                f"or configure SANDBOX_DOCKER_USER to match host execution identity."
+            )
+
+    except Exception as e:
+        raise RuntimeError(f"Could not establish secure IPC mount permissions: {str(e)}") from e
+
+
+_CLEANUP_PATH_PATTERN = re.compile(
+    r"(?:[a-zA-Z]:[\\/]|/(?:usr|var|tmp|etc|home|root|workspace|proc|sys|opt))[^\s:\"',]+"
+)
+_CLEANUP_SECRET_PATTERN = re.compile(
+    r"(?:password|secret|token|key|credential|auth)\s*[:=]\s*[^\s,;]+",
+    re.IGNORECASE,
+)
+
+
+def _sanitize_cleanup_diagnostic(raw_err: str) -> str:
+    """
+    Sanitizes container cleanup error diagnostics for user-facing errors.
+
+    Sanitization Strategy:
+      - Strips boilerplate Docker daemon prefixes ('Error response from daemon:').
+      - Redacts recognized credential/token assignments ('token=...', 'password=...').
+      - Redacts recognized absolute host and container filesystem paths.
+      - Collapses internal newlines and whitespace.
+      - Enforces a 120-character ceiling to prevent log/UI flooding.
+
+    Honest Security Limitation:
+      Length bounding prevents log flooding but is NOT a secret/path redaction mechanism.
+      Redaction is performed via targeted regex replacement. However, because external CLI
+      processes can emit arbitrary unstructured stderr, regex heuristics cannot formally
+      guarantee that every conceivable sensitive value is redacted.
+    """
+    if not raw_err:
+        return ""
+    text = str(raw_err).replace("\n", " ").strip()
+    text = re.sub(r"Error response from daemon:\s*", "", text, flags=re.IGNORECASE)
+    text = _CLEANUP_SECRET_PATTERN.sub("[redacted]", text)
+    text = _CLEANUP_PATH_PATTERN.sub("[path]", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    if len(text) > 120:
+        text = text[:117] + "..."
+    return text
+
+
+def _format_with_cleanup_warning(primary_msg: str, cleanup_errors: List[str]) -> str:
+    """
+    Appends a sanitized cleanup warning to a primary failure message.
+    The primary error remains leading and unmasked.
+    """
+    if not cleanup_errors:
+        return primary_msg
+
+    clean_errs = []
+    for err in cleanup_errors:
+        if not err:
+            continue
+        sanitized = _sanitize_cleanup_diagnostic(err)
+        if sanitized:
+            clean_errs.append(sanitized)
+
+    if not clean_errs:
+        return primary_msg
+    return f"{primary_msg} (Cleanup warning: {'; '.join(clean_errs)})"
 
 
 def _validate_host_output_files(
@@ -1125,10 +1375,23 @@ class SandboxExecutor:
                             "but Docker daemon is unreachable or docker command is not found. "
                             "Execution rejected under fail-closed security policy."
                         )
+                    try:
+                        container_user = _get_docker_user()
+                    except ValueError as e:
+                        return False, f"Execution setup failed: {str(e)}"
+
+                    try:
+                        _setup_ipc_mount_permissions(
+                            ipc_dir, in_dir, out_dir, container_user=container_user
+                        )
+                    except Exception as e:
+                        return False, f"Execution setup failed: {str(e)}"
+
                     docker_cmd, container_name = _build_docker_cmd(
                         in_dir,
                         out_dir,
                         image_name=self.docker_image,
+                        container_user=container_user,
                         timeout_seconds=timeout_seconds,
                     )
                     try:
@@ -1177,28 +1440,62 @@ class SandboxExecutor:
                     return False, f"Execution setup failed: Unrecognized sandbox backend '{self.backend}'."
 
                 # 4. Wait for execution under hard wall-clock deadline
+                timed_out = False
+                cleaned_up = False
+                cleanup_errors: List[str] = []
+                exec_error: Optional[str] = None
+
                 try:
                     try:
                         proc.wait(timeout=timeout_seconds)
                     except subprocess.TimeoutExpired:
-                        if container_name:
-                            _kill_and_remove_docker_container(container_name)
-                        else:
-                            _terminate_process_tree(proc, job=job)
-                        return False, f"Execution timed out after {timeout_seconds} seconds."
+                        timed_out = True
+                        exec_error = f"Execution timed out after {timeout_seconds} seconds."
                     except Exception as e:
-                        if container_name:
-                            _kill_and_remove_docker_container(container_name)
-                        else:
-                            _terminate_process_tree(proc, job=job)
-                        return False, f"Execution process failure: {str(e)}"
+                        exec_error = f"Execution process failure: {str(e)}"
                 finally:
-                    if container_name:
-                        _kill_and_remove_docker_container(container_name)
+                    # Bounded termination and cleanup executed ONCE per execution path
+                    try:
+                        if container_name and not cleaned_up:
+                            cleaned_up = True
+                            poll_res = proc.poll() if proc is not None else None
+                            if timed_out or poll_res is None or poll_res != 0:
+                                # 1. Terminate and reap host Docker CLI subprocess if still alive
+                                if proc is not None and proc.poll() is None:
+                                    try:
+                                        proc.kill()
+                                        proc.wait(timeout=2.0)
+                                    except Exception as e:
+                                        cleanup_errors.append(f"proc reap error: {str(e)}")
+
+                                # 2. Terminate and remove container from Docker daemon
+                                try:
+                                    ok_c, diag_c = _kill_and_remove_docker_container(container_name)
+                                    if not ok_c and diag_c:
+                                        cleanup_errors.append(diag_c)
+                                except Exception as e:
+                                    cleanup_errors.append(f"container cleanup error: {str(e)}")
+
+                        elif not container_name:
+                            # Non-Docker backend (e.g. Windows Job Object)
+                            if timed_out or (proc is not None and proc.poll() is None):
+                                _terminate_process_tree(proc, job=job)
+                    except Exception as e:
+                        cleanup_errors.append(f"cleanup error: {str(e)}")
+
                     if job is not None:
-                        job.close()
+                        try:
+                            job.close()
+                        except Exception:
+                            pass
                     if hasattr(proc, "close"):
-                        proc.close()
+                        try:
+                            proc.close()
+                        except Exception:
+                            pass
+
+                if exec_error is not None:
+                    return False, _format_with_cleanup_warning(exec_error, cleanup_errors)
 
                 # Resolve output paths (handling legacy/mock test workers that write to ipc_dir or in_dir)
                 if not os.path.exists(resp_path):
@@ -1226,11 +1523,35 @@ class SandboxExecutor:
                             with open(resp_path, "r", encoding="utf-8") as f:
                                 data = json.load(f)
                             if data.get("error_message"):
-                                return False, data["error_message"]
+                                return False, _format_with_cleanup_warning(data["error_message"], cleanup_errors)
                         except Exception:
                             pass
 
-                    return False, f"Execution worker exited with code {proc.returncode}."
+                    if self.backend == "docker":
+                        if proc.returncode == 125:
+                            return False, _format_with_cleanup_warning(
+                                f"Execution failed: Docker sandbox container failed to start (exit code 125). "
+                                f"Verify that Docker daemon is running and the sandbox image '{self.docker_image}' "
+                                f"is built locally with 'docker build -t {self.docker_image} -f Dockerfile.sandbox .'",
+                                cleanup_errors,
+                            )
+                        elif proc.returncode == 126:
+                            return False, _format_with_cleanup_warning(
+                                f"Execution failed: Docker sandbox container command could not be invoked (exit code 126). "
+                                f"Verify container entrypoint executable permissions and binary architecture in image '{self.docker_image}'.",
+                                cleanup_errors,
+                            )
+                        elif proc.returncode == 127:
+                            return False, _format_with_cleanup_warning(
+                                f"Execution failed: Docker sandbox container command not found (exit code 127). "
+                                f"Verify that Python and worker script exist inside container image '{self.docker_image}'.",
+                                cleanup_errors,
+                            )
+
+                    return False, _format_with_cleanup_warning(
+                        f"Execution worker exited with code {proc.returncode}.",
+                        cleanup_errors,
+                    )
 
                 # 6. Rigorous host-side validation of output files before reading
                 is_valid_out, out_err = _validate_host_output_files(
@@ -1242,28 +1563,28 @@ class SandboxExecutor:
                     max_total_bytes=MAX_TOTAL_IPC_BYTES,
                 )
                 if not is_valid_out:
-                    return False, f"Execution failed: {out_err}"
+                    return False, _format_with_cleanup_warning(f"Execution failed: {out_err}", cleanup_errors)
 
                 try:
                     with open(resp_path, "r", encoding="utf-8") as f:
                         response_data = json.load(f)
                 except Exception as e:
-                    return False, f"Execution failed: Malformed response envelope: {str(e)}"
+                    return False, _format_with_cleanup_warning(f"Execution failed: Malformed response envelope: {str(e)}", cleanup_errors)
 
                 if not isinstance(response_data, dict):
-                    return False, "Execution failed: Response envelope root must be a JSON object."
+                    return False, _format_with_cleanup_warning("Execution failed: Response envelope root must be a JSON object.", cleanup_errors)
 
                 # Validate protocol version
                 if response_data.get("version") != "1.0":
-                    return False, f"Execution failed: Incompatible protocol response version '{response_data.get('version')}'."
+                    return False, _format_with_cleanup_warning(f"Execution failed: Incompatible protocol response version '{response_data.get('version')}'.", cleanup_errors)
 
                 # Validate status
                 status = response_data.get("status")
                 if status not in ("success", "error"):
-                    return False, f"Execution failed: Unknown protocol status '{status}'."
+                    return False, _format_with_cleanup_warning(f"Execution failed: Unknown protocol status '{status}'.", cleanup_errors)
 
                 if status == "error":
-                    return False, response_data.get("error_message", "Execution failed.")
+                    return False, _format_with_cleanup_warning(response_data.get("error_message", "Execution failed."), cleanup_errors)
 
                 # Validate result_type
                 result_type = response_data.get("result_type")
@@ -1272,32 +1593,32 @@ class SandboxExecutor:
                     "str", "datetime", "nan", "pd_na", "none", "dict", "list"
                 }
                 if result_type not in valid_types:
-                    return False, f"Protocol violation: Unrecognized result type '{result_type}'."
+                    return False, _format_with_cleanup_warning(f"Protocol violation: Unrecognized result type '{result_type}'.", cleanup_errors)
 
                 has_arrow_data = bool(response_data.get("has_arrow_data", False))
 
                 # Contradiction checks
                 if has_arrow_data and result_type not in ("dataframe", "series"):
-                    return False, "Protocol violation: Inconsistent tabular metadata (arrow data declared for non-tabular result)."
+                    return False, _format_with_cleanup_warning("Protocol violation: Inconsistent tabular metadata (arrow data declared for non-tabular result).", cleanup_errors)
 
                 if not has_arrow_data and result_type in ("dataframe", "series"):
-                    return False, "Protocol violation: Missing expected tabular payload for tabular result type."
+                    return False, _format_with_cleanup_warning("Protocol violation: Missing expected tabular payload for tabular result type.", cleanup_errors)
 
                 # 8. Deserialize result payload safely
                 if has_arrow_data:
                     if not os.path.exists(output_arrow_path):
-                        return False, "Execution failed: Output tabular payload missing from IPC directory."
+                        return False, _format_with_cleanup_warning("Execution failed: Output tabular payload missing from IPC directory.", cleanup_errors)
 
                     out_arrow_size = os.path.getsize(output_arrow_path)
                     if out_arrow_size > MAX_RESULT_ARROW_BYTES:
-                        return False, f"Execution failed: Result tabular payload size ({out_arrow_size // (1024*1024)} MiB) exceeds limit ({MAX_RESULT_ARROW_BYTES // (1024*1024)} MiB)."
+                        return False, _format_with_cleanup_warning(f"Execution failed: Result tabular payload size ({out_arrow_size // (1024*1024)} MiB) exceeds limit ({MAX_RESULT_ARROW_BYTES // (1024*1024)} MiB).", cleanup_errors)
 
                     try:
                         with open(output_arrow_path, "rb") as f:
                             reader = ipc.open_stream(f)
                             df_res = reader.read_pandas()
                     except Exception as e:
-                        return False, f"Execution failed: Could not deserialize result dataset: {str(e)}"
+                        return False, _format_with_cleanup_warning(f"Execution failed: Could not deserialize result dataset: {str(e)}", cleanup_errors)
 
                     if result_type == "series":
                         series_res = df_res.iloc[:, 0]

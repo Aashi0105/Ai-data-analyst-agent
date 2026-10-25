@@ -1628,6 +1628,8 @@ def test_docker_command_construction_and_security_flags(tmp_path):
     assert "--pids-limit=16" in cmd
     assert "--tmpfs" in cmd and cmd[cmd.index("--tmpfs") + 1] == "/tmp:rw,noexec,nosuid,size=64m"
 
+    assert "--pull=never" in cmd
+
     abs_in = os.path.abspath(in_dir)
     abs_out = os.path.abspath(out_dir)
     expected_in_mount = f"{abs_in}:/workspace/ipc/in:ro"
@@ -1635,8 +1637,10 @@ def test_docker_command_construction_and_security_flags(tmp_path):
     assert expected_in_mount in cmd
     assert expected_out_mount in cmd
 
-    assert "--in-dir" in cmd and cmd[cmd.index("--in-dir") + 1] == "/workspace/ipc/in"
-    assert "--out-dir" in cmd and cmd[cmd.index("--out-dir") + 1] == "/workspace/ipc/out"
+    # Verify arguments after image name match the Dockerfile ENTRYPOINT contract without duplicate python invocation
+    image_idx = cmd.index("test-sandbox:1.0")
+    assert cmd[image_idx + 1 :] == ["--in-dir", "/workspace/ipc/in", "--out-dir", "/workspace/ipc/out"]
+    assert "python" not in cmd[image_idx :]
 
 
 def test_host_output_validation_rejects_symlinks(tmp_path, monkeypatch):
@@ -1870,3 +1874,756 @@ def test_docker_real_container_timeout_and_cleanup_integration(sample_df):
     success, error_msg = executor.execute(code, sample_df, timeout_seconds=2.0)
     assert success is False
     assert "timed out" in error_msg.lower()
+
+
+# =========================================================================
+# Task 07C.2.2 — Docker Blockers Regression & Hardening Tests
+# =========================================================================
+
+def test_docker_command_entrypoint_compatibility_regression(tmp_path):
+    """
+    [REGRESSION TEST]
+    Verifies that _build_docker_cmd strictly obeys the Dockerfile.sandbox ENTRYPOINT contract:
+    - Dockerfile.sandbox defines: ENTRYPOINT ["python", "-u", "/workspace/sandbox_worker.py"]
+    - Therefore, docker run arguments AFTER image_name MUST ONLY be worker CLI flags (--in-dir, --out-dir)
+    - Must NOT repeat python, -u, or sandbox_worker.py, which would cause argparse to crash with code 2.
+    """
+    dockerfile_path = Path(__file__).resolve().parent.parent / "Dockerfile.sandbox"
+    assert dockerfile_path.is_file(), "Dockerfile.sandbox must exist in repository root"
+    dockerfile_content = dockerfile_path.read_text(encoding="utf-8")
+    assert 'ENTRYPOINT ["python", "-u", "/workspace/sandbox_worker.py"]' in dockerfile_content
+
+    cmd, container_name = sandbox._build_docker_cmd(
+        in_dir=str(tmp_path / "in"),
+        out_dir=str(tmp_path / "out"),
+        image_name="ai-data-analyst-sandbox:latest",
+    )
+
+    image_idx = cmd.index("ai-data-analyst-sandbox:latest")
+    trailing_args = cmd[image_idx + 1 :]
+
+    # Arguments after image name must ONLY be CLI flags, not an extra python invocation
+    assert trailing_args == ["--in-dir", "/workspace/ipc/in", "--out-dir", "/workspace/ipc/out"]
+    assert "python" not in trailing_args
+    assert "/workspace/sandbox_worker.py" not in trailing_args
+
+
+def test_ipc_mount_permissions_setup_noop_on_windows(tmp_path):
+    """
+    [CROSS-PLATFORM UNIT TEST]
+    Verifies that _setup_ipc_mount_permissions is a safe no-op on Windows hosts,
+    preserving exact Windows Job Object runtime behavior without raising errors.
+    """
+    ipc_dir = tmp_path / "ipc"
+    in_dir = ipc_dir / "in"
+    out_dir = ipc_dir / "out"
+    in_dir.mkdir(parents=True)
+    out_dir.mkdir(parents=True)
+    (in_dir / "request.json").write_text("{}", encoding="utf-8")
+
+    # On Windows, this must return cleanly
+    sandbox._setup_ipc_mount_permissions(str(ipc_dir), str(in_dir), str(out_dir))
+
+
+def test_docker_user_derivation_non_root_and_root(monkeypatch):
+    """
+    [CROSS-PLATFORM UNIT TEST]
+    Verifies that _get_docker_user:
+      - Aligns container execution with host identity when running unprivileged (os.getuid() != 0)
+      - Falls back to unprivileged 10001:10001 when host is root (os.getuid() == 0)
+      - Honors valid UID:GID and UID-only SANDBOX_DOCKER_USER overrides
+      - Rejects malformed SANDBOX_DOCKER_USER overrides with ValueError
+    """
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setattr(os, "getuid", lambda: 1000, raising=False)
+    monkeypatch.setattr(os, "getgid", lambda: 1000, raising=False)
+    monkeypatch.delenv("SANDBOX_DOCKER_USER", raising=False)
+
+    # 1. Non-root host user -> aligns with host UID/GID
+    assert sandbox._get_docker_user() == "1000:1000"
+
+    # 2. Root host user -> falls back to unprivileged 10001:10001
+    monkeypatch.setattr(os, "getuid", lambda: 0, raising=False)
+    monkeypatch.setattr(os, "getgid", lambda: 0, raising=False)
+    assert sandbox._get_docker_user() == "10001:10001"
+
+    # 3. Explicit valid environment overrides (UID:GID and UID-only)
+    monkeypatch.setenv("SANDBOX_DOCKER_USER", "20002:20002")
+    assert sandbox._get_docker_user() == "20002:20002"
+
+    monkeypatch.setenv("SANDBOX_DOCKER_USER", "30003")
+    assert sandbox._get_docker_user() == "30003"
+
+    # 4. Malformed environment overrides reject with ValueError
+    for bad_user in ["", "   ", "abc", "-1", "1000:abc", "1:2:3", "1000:-5"]:
+        monkeypatch.setenv("SANDBOX_DOCKER_USER", bad_user)
+        if not bad_user.strip():
+            # Empty/whitespace is ignored and falls back to host default
+            pass
+        else:
+            with pytest.raises(ValueError) as exc:
+                sandbox._get_docker_user()
+            assert "malformed container user" in str(exc.value).lower() or "must be a non-negative integer" in str(exc.value).lower()
+
+
+def test_ipc_mount_permissions_setup_aligned_identity_strict_mode_700(tmp_path, monkeypatch):
+    """
+    [POSIX UNIT TEST - ALIGNED IDENTITY (RECOMMENDED PATTERN)]
+    When container worker runs as the host's unprivileged UID/GID:
+      - ipc_dir: 0o700
+      - in_dir: 0o700, files: 0o600
+      - out_dir: 0o700
+    Verifies zero permissive modes (no 0o777, no 0o1777), zero chown calls, and zero ACL dependencies.
+    """
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setattr(os, "getuid", lambda: 1000, raising=False)
+    monkeypatch.setattr(os, "getgid", lambda: 1000, raising=False)
+
+    ipc_dir = tmp_path / "ipc_aligned"
+    in_dir = ipc_dir / "in"
+    out_dir = ipc_dir / "out"
+    in_dir.mkdir(parents=True)
+    out_dir.mkdir(parents=True)
+    (in_dir / "request.json").write_text("{}", encoding="utf-8")
+
+    recorded_chmods = {}
+    monkeypatch.setattr(os, "chmod", lambda p, m: recorded_chmods.update({str(p): m}))
+
+    # Verify aligned execution identity
+    sandbox._setup_ipc_mount_permissions(str(ipc_dir), str(in_dir), str(out_dir), container_user="1000:1000")
+
+    assert recorded_chmods[str(ipc_dir)] == 0o700
+    assert recorded_chmods[str(in_dir)] == 0o700
+    assert recorded_chmods[str(in_dir / "request.json")] == 0o600
+    assert recorded_chmods[str(out_dir)] == 0o700
+
+
+def test_ipc_mount_permissions_setup_root_host_chowns_cleanly(tmp_path, monkeypatch):
+    """
+    [POSIX UNIT TEST - ROOT HOST PATTERN]
+    When host process is root (UID 0) and container is unprivileged (10001:10001):
+      - out_dir is chowned to 10001:10001 with mode 0o700
+      - in_dir is mode 0o755 with files 0o644
+    """
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setattr(os, "getuid", lambda: 0, raising=False)
+    monkeypatch.setattr(os, "getgid", lambda: 0, raising=False)
+
+    ipc_dir = tmp_path / "ipc_root"
+    in_dir = ipc_dir / "in"
+    out_dir = ipc_dir / "out"
+    in_dir.mkdir(parents=True)
+    out_dir.mkdir(parents=True)
+    (in_dir / "request.json").write_text("{}", encoding="utf-8")
+
+    recorded_chmods = {}
+    recorded_chowns = {}
+    monkeypatch.setattr(os, "chmod", lambda p, m: recorded_chmods.update({str(p): m}))
+    monkeypatch.setattr(os, "chown", lambda p, u, g: recorded_chowns.update({str(p): (u, g)}), raising=False)
+
+    sandbox._setup_ipc_mount_permissions(str(ipc_dir), str(in_dir), str(out_dir), container_user="10001:10001")
+
+    assert recorded_chmods[str(ipc_dir)] == 0o700
+    assert recorded_chmods[str(in_dir)] == 0o755
+    assert recorded_chmods[str(in_dir / "request.json")] == 0o644
+    assert recorded_chowns[str(out_dir)] == (10001, 10001)
+    assert recorded_chmods[str(out_dir)] == 0o700
+
+
+def test_ipc_mount_permissions_setup_mismatched_unprivileged_fails_closed(tmp_path, monkeypatch):
+    """
+    [POSIX UNIT TEST - FAIL CLOSED ON MISMATCHED UNPRIVILEGED IDENTITY]
+    When host UID is unprivileged (e.g. 1000) and container_user is mismatched (e.g. 20002:20002),
+    and safe ownership cannot be established without world-writable permissions:
+      - Must FAIL CLOSED with RuntimeError
+      - Must NOT fall back to permissive mode 0o777 or 0o1777
+    """
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setattr(os, "getuid", lambda: 1000, raising=False)
+    monkeypatch.setattr(os, "getgid", lambda: 1000, raising=False)
+
+    ipc_dir = tmp_path / "ipc_mismatch"
+    in_dir = ipc_dir / "in"
+    out_dir = ipc_dir / "out"
+    in_dir.mkdir(parents=True)
+    out_dir.mkdir(parents=True)
+    (in_dir / "request.json").write_text("{}", encoding="utf-8")
+
+    def mock_chown_fail(path, uid, gid):
+        raise PermissionError("Operation not permitted")
+
+    monkeypatch.setattr(os, "chown", mock_chown_fail, raising=False)
+    import shutil
+    monkeypatch.setattr(shutil, "which", lambda cmd: None)  # setfacl unavailable
+
+    with pytest.raises(RuntimeError) as exc_info:
+        sandbox._setup_ipc_mount_permissions(str(ipc_dir), str(in_dir), str(out_dir), container_user="20002:20002")
+
+    assert "cannot establish secure, non-permissive ipc mount permissions" in str(exc_info.value).lower()
+
+
+def test_docker_cleanup_skips_redundant_calls_on_clean_exit(sample_df, monkeypatch):
+    """
+    [UNIT TEST]
+    Verifies that _kill_and_remove_docker_container is NOT invoked when a container exits
+    cleanly with code 0 (since --rm already auto-removes it), but IS invoked if it times out
+    or exits abnormally.
+    """
+    cleanup_calls = []
+
+    def mock_cleanup(name):
+        cleanup_calls.append(name)
+        return (True, "")
+
+    monkeypatch.setattr(sandbox, "_kill_and_remove_docker_container", mock_cleanup)
+    monkeypatch.setattr(sandbox, "_is_docker_available", lambda: True)
+
+    class MockCleanProc:
+        def __init__(self):
+            self.returncode = 0
+            self.pid = 9999
+
+        def poll(self):
+            return 0
+
+        def wait(self, timeout=None):
+            return 0
+
+    class MockFailedProc:
+        def __init__(self):
+            self.returncode = 1
+            self.pid = 9998
+
+        def poll(self):
+            return 1
+
+        def wait(self, timeout=None):
+            return 1
+
+    # 1. Clean exit (code 0) -> no cleanup subprocesses
+    def mock_clean_popen(*args, **kwargs):
+        # Write valid response so host doesn't fail before completing
+        out_mount = next((arg for arg in args[0] if ":/workspace/ipc/out" in arg), None)
+        out_dir = out_mount.split(":/workspace/ipc/out")[0] if out_mount else args[0][args[0].index("--out-dir") + 1]
+        resp_file = os.path.join(out_dir, "response.json")
+        with open(resp_file, "w", encoding="utf-8") as f:
+            json.dump({"version": "1.0", "status": "success", "result_type": "int", "has_arrow_data": False, "scalar_value": 42}, f)
+        return MockCleanProc()
+
+    monkeypatch.setattr(subprocess, "Popen", mock_clean_popen)
+
+    executor = SandboxExecutor(backend="docker")
+    success, res = executor.execute("result = 42", sample_df)
+    assert success is True
+    assert res == 42
+    assert len(cleanup_calls) == 0, f"Redundant cleanup called on clean exit: {cleanup_calls}"
+
+    # 2. Abnormal exit (code 1) -> cleanup IS invoked exactly once
+    def mock_failed_popen(*args, **kwargs):
+        return MockFailedProc()
+
+    monkeypatch.setattr(subprocess, "Popen", mock_failed_popen)
+    success, err = executor.execute("result = 42", sample_df)
+    assert success is False
+    assert len(cleanup_calls) == 1, f"Expected exactly 1 cleanup call on abnormal exit, got {len(cleanup_calls)}"
+
+
+def test_docker_timeout_terminates_and_reaps_host_process(sample_df, monkeypatch):
+    """
+    [UNIT TEST]
+    Verifies that on timeout:
+      1. Host Docker CLI subprocess is explicitly killed (proc.kill()) and reaped (proc.wait())
+      2. _kill_and_remove_docker_container is invoked exactly once
+      3. Original timeout error message is preserved even if cleanup fails
+    """
+    cleanup_calls = []
+
+    def mock_cleanup(name):
+        cleanup_calls.append(name)
+        return (False, "mock daemon timeout")
+
+    monkeypatch.setattr(sandbox, "_kill_and_remove_docker_container", mock_cleanup)
+    monkeypatch.setattr(sandbox, "_is_docker_available", lambda: True)
+
+    class MockTimeoutProc:
+        def __init__(self):
+            self.pid = 5555
+            self.killed = False
+            self.reaped = False
+            self.returncode = None
+
+        def poll(self):
+            return -9 if self.killed else None
+
+        def wait(self, timeout=None):
+            if timeout is not None and not self.killed:
+                raise subprocess.TimeoutExpired(cmd="docker", timeout=timeout)
+            self.reaped = True
+            self.returncode = -9
+            return -9
+
+        def kill(self):
+            self.killed = True
+
+    proc_instance = MockTimeoutProc()
+    monkeypatch.setattr(subprocess, "Popen", lambda *args, **kwargs: proc_instance)
+
+    executor = SandboxExecutor(backend="docker")
+    success, error_msg = executor.execute("result = 1", sample_df, timeout_seconds=1.0)
+
+    # 1. Timeout error preserved with cleanup warning surfaced
+    assert success is False
+    assert "timed out after 1.0 seconds" in error_msg.lower()
+    assert "cleanup warning" in error_msg.lower()
+    assert "mock daemon timeout" in error_msg.lower()
+
+    # 2. Host process terminated and reaped
+    assert proc_instance.killed is True, "Host Docker CLI subprocess was not killed on timeout!"
+    assert proc_instance.reaped is True, "Host Docker CLI subprocess was not reaped on timeout!"
+
+    # 3. Container cleanup called exactly once
+    assert len(cleanup_calls) == 1, f"Cleanup must be called exactly once on timeout, got {len(cleanup_calls)}"
+
+
+def test_docker_startup_diagnostics_exit_codes_125_126_127(sample_df, monkeypatch):
+    """
+    [UNIT TEST]
+    Verifies specific, actionable diagnostics for Docker container launch failures:
+      - Exit code 125: daemon error or missing image
+      - Exit code 126: command could not be invoked (permissions/exec format)
+      - Exit code 127: command not found in container
+    """
+    monkeypatch.setattr(sandbox, "_is_docker_available", lambda: True)
+    monkeypatch.setattr(sandbox, "_kill_and_remove_docker_container", lambda name: (True, ""))
+
+    class MockExitCodeProc:
+        def __init__(self, code):
+            self.returncode = code
+            self.pid = 12345
+
+        def poll(self):
+            return self.returncode
+
+        def wait(self, timeout=None):
+            return self.returncode
+
+    executor = SandboxExecutor(backend="docker")
+
+    # Exit code 125
+    monkeypatch.setattr(subprocess, "Popen", lambda *args, **kwargs: MockExitCodeProc(125))
+    success, error_msg = executor.execute("result = 1", sample_df)
+    assert success is False
+    assert "exit code 125" in error_msg.lower()
+    assert "docker build -t" in error_msg.lower()
+
+    # Exit code 126
+    monkeypatch.setattr(subprocess, "Popen", lambda *args, **kwargs: MockExitCodeProc(126))
+    success, error_msg = executor.execute("result = 1", sample_df)
+    assert success is False
+    assert "exit code 126" in error_msg.lower()
+    assert "could not be invoked" in error_msg.lower()
+
+    # Exit code 127
+    monkeypatch.setattr(subprocess, "Popen", lambda *args, **kwargs: MockExitCodeProc(127))
+    success, error_msg = executor.execute("result = 1", sample_df)
+    assert success is False
+    assert "exit code 127" in error_msg.lower()
+    assert "command not found" in error_msg.lower()
+
+
+def test_user_code_error_not_misclassified_as_docker_startup_error(sample_df, monkeypatch):
+    """
+    [UNIT TEST]
+    Verifies that when worker exits with non-zero code (e.g. 1) but produces a structured
+    response envelope with an error_message (e.g. division by zero), that diagnostic is returned
+    and NOT misclassified as a Docker startup error.
+    """
+    monkeypatch.setattr(sandbox, "_is_docker_available", lambda: True)
+    monkeypatch.setattr(sandbox, "_kill_and_remove_docker_container", lambda name: (True, ""))
+
+    class MockUserErrorProc:
+        def __init__(self):
+            self.returncode = 1
+            self.pid = 7777
+
+        def poll(self):
+            return 1
+
+        def wait(self, timeout=None):
+            return 1
+
+    def mock_popen(*args, **kwargs):
+        out_mount = next((arg for arg in args[0] if ":/workspace/ipc/out" in arg), None)
+        out_dir = out_mount.split(":/workspace/ipc/out")[0] if out_mount else args[0][args[0].index("--out-dir") + 1]
+        resp_file = os.path.join(out_dir, "response.json")
+        with open(resp_file, "w", encoding="utf-8") as f:
+            json.dump({
+                "version": "1.0",
+                "status": "error",
+                "result_type": "none",
+                "has_arrow_data": False,
+                "scalar_value": None,
+                "error_type": "ZeroDivisionError",
+                "error_message": "Calculation error: Division by zero encountered."
+            }, f)
+        return MockUserErrorProc()
+
+    monkeypatch.setattr(subprocess, "Popen", mock_popen)
+
+    executor = SandboxExecutor(backend="docker")
+    success, error_msg = executor.execute("result = 1", sample_df)
+
+    assert success is False
+    assert "division by zero" in error_msg.lower()
+    assert "exit code" not in error_msg.lower()
+
+
+def test_docker_primary_execution_failure_surfaces_cleanup_warning(sample_df, monkeypatch):
+    """
+    [UNIT TEST]
+    Verifies that when a primary execution failure occurs (e.g. exit code 1) and container
+    cleanup also fails, the primary failure is preserved AND the cleanup warning is surfaced.
+    """
+    monkeypatch.setattr(sandbox, "_is_docker_available", lambda: True)
+    monkeypatch.setattr(
+        sandbox,
+        "_kill_and_remove_docker_container",
+        lambda name: (False, "docker rm error: daemon hung"),
+    )
+
+    class MockExit1Proc:
+        def __init__(self):
+            self.returncode = 1
+            self.pid = 8888
+
+        def poll(self):
+            return 1
+
+        def wait(self, timeout=None):
+            return 1
+
+    monkeypatch.setattr(subprocess, "Popen", lambda *args, **kwargs: MockExit1Proc())
+
+    executor = SandboxExecutor(backend="docker")
+    success, error_msg = executor.execute("result = 1", sample_df)
+
+    assert success is False
+    # Primary failure preserved
+    assert "exited with code 1" in error_msg.lower()
+    # Cleanup warning surfaced
+    assert "cleanup warning" in error_msg.lower()
+    assert "daemon hung" in error_msg.lower()
+
+
+def test_docker_user_code_error_surfaces_cleanup_warning(sample_df, monkeypatch):
+    """
+    [UNIT TEST]
+    Verifies that when user code fails with a structured error in response.json and cleanup
+    also fails, the user error message is preserved along with the cleanup warning.
+    """
+    monkeypatch.setattr(sandbox, "_is_docker_available", lambda: True)
+    monkeypatch.setattr(
+        sandbox,
+        "_kill_and_remove_docker_container",
+        lambda name: (False, "docker kill error: container not responding"),
+    )
+
+    class MockUserProc:
+        def __init__(self):
+            self.returncode = 1
+            self.pid = 9991
+
+        def poll(self):
+            return 1
+
+        def wait(self, timeout=None):
+            return 1
+
+    def mock_popen(*args, **kwargs):
+        out_mount = next((arg for arg in args[0] if ":/workspace/ipc/out" in arg), None)
+        out_dir = out_mount.split(":/workspace/ipc/out")[0] if out_mount else args[0][args[0].index("--out-dir") + 1]
+        resp_file = os.path.join(out_dir, "response.json")
+        with open(resp_file, "w", encoding="utf-8") as f:
+            json.dump({
+                "version": "1.0",
+                "status": "error",
+                "result_type": "none",
+                "has_arrow_data": False,
+                "scalar_value": None,
+                "error_type": "ValueError",
+                "error_message": "Invalid column index specified."
+            }, f)
+        return MockUserProc()
+
+    monkeypatch.setattr(subprocess, "Popen", mock_popen)
+
+    executor = SandboxExecutor(backend="docker")
+    success, error_msg = executor.execute("result = 1", sample_df)
+
+    assert success is False
+    assert "invalid column index" in error_msg.lower()
+    assert "cleanup warning" in error_msg.lower()
+    assert "container not responding" in error_msg.lower()
+
+
+def test_ipc_mount_permissions_setup_aligned_uid_only(tmp_path, monkeypatch):
+    """
+    [POSIX UNIT TEST]
+    Verifies that when container_user is provided as a UID-only string (e.g. '1000'),
+    matching the host unprivileged UID:
+      - Resolves successfully under Case A (aligned identity)
+      - Sets mode 0o700 on ipc_dir, in_dir, and out_dir without error
+    """
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setattr(os, "getuid", lambda: 1000, raising=False)
+    monkeypatch.setattr(os, "getgid", lambda: 1000, raising=False)
+
+    ipc_dir = tmp_path / "ipc_uid_only"
+    in_dir = ipc_dir / "in"
+    out_dir = ipc_dir / "out"
+    in_dir.mkdir(parents=True)
+    out_dir.mkdir(parents=True)
+    (in_dir / "request.json").write_text("{}", encoding="utf-8")
+
+    recorded_chmods = {}
+    monkeypatch.setattr(os, "chmod", lambda p, m: recorded_chmods.update({str(p): m}))
+
+    # container_user passed as UID-only integer string
+    sandbox._setup_ipc_mount_permissions(str(ipc_dir), str(in_dir), str(out_dir), container_user="1000")
+
+    assert recorded_chmods[str(ipc_dir)] == 0o700
+    assert recorded_chmods[str(in_dir)] == 0o700
+    assert recorded_chmods[str(in_dir / "request.json")] == 0o600
+    assert recorded_chmods[str(out_dir)] == 0o700
+
+
+def test_ipc_mount_permissions_setup_malformed_container_user_raises(tmp_path, monkeypatch):
+    """
+    [CROSS-PLATFORM UNIT TEST]
+    Verifies that _setup_ipc_mount_permissions rejects malformed container_user strings with ValueError.
+    """
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setattr(os, "getuid", lambda: 1000, raising=False)
+    monkeypatch.setattr(os, "getgid", lambda: 1000, raising=False)
+
+    ipc_dir = tmp_path / "ipc_malformed"
+    in_dir = ipc_dir / "in"
+    out_dir = ipc_dir / "out"
+    in_dir.mkdir(parents=True)
+    out_dir.mkdir(parents=True)
+
+    with pytest.raises(ValueError) as exc:
+        sandbox._setup_ipc_mount_permissions(str(ipc_dir), str(in_dir), str(out_dir), container_user="bad:user:id")
+
+    assert "malformed container user" in str(exc.value).lower()
+
+
+def test_cleanup_diagnostic_sanitization():
+    """
+    [UNIT TEST]
+    Demonstrates that _sanitize_cleanup_diagnostic:
+      1. Strips verbose 'Error response from daemon:' boilerplate
+      2. Redacts recognized credential/token patterns ('token=...', 'secret=...')
+      3. Redacts recognized absolute filesystem paths (POSIX /var/..., Windows C:\\...)
+      4. Bounds length to 120 characters
+    """
+    # 1. Daemon boilerplate stripped, path redacted, secret redacted
+    raw_1 = (
+        "Error response from daemon: failed to remove /var/lib/docker/overlay2/abc12345/merged: "
+        "permission denied with token=supersecret_api_key_12345"
+    )
+    sanitized_1 = sandbox._sanitize_cleanup_diagnostic(raw_1)
+    assert "Error response from daemon" not in sanitized_1
+    assert "/var/lib/docker" not in sanitized_1
+    assert "[path]" in sanitized_1
+    assert "supersecret_api_key_12345" not in sanitized_1
+    assert "[redacted]" in sanitized_1
+
+    # 2. Windows absolute paths redacted
+    raw_2 = "docker kill error: Access denied on C:\\Users\\Administrator\\AppData\\Local\\Temp\\agy_ipc"
+    sanitized_2 = sandbox._sanitize_cleanup_diagnostic(raw_2)
+    assert "C:\\Users\\Administrator" not in sanitized_2
+    assert "[path]" in sanitized_2
+
+    # 3. Message length bounded to <= 120 characters
+    long_raw = "docker kill failed: " + ("x" * 200)
+    sanitized_long = sandbox._sanitize_cleanup_diagnostic(long_raw)
+    assert len(sanitized_long) <= 120
+    assert sanitized_long.endswith("...")
+
+
+def test_docker_cleanup_exception_does_not_mask_primary_error(sample_df, monkeypatch):
+    """
+    [UNIT TEST]
+    Demonstrates that if _kill_and_remove_docker_container itself raises an unhandled exception,
+    the primary error (timeout) is PRESERVED and not replaced by an unhandled cleanup crash.
+    """
+    monkeypatch.setattr(sandbox, "_is_docker_available", lambda: True)
+
+    def mock_raising_cleanup(name):
+        raise RuntimeError("Unexpected daemon socket crash")
+
+    monkeypatch.setattr(sandbox, "_kill_and_remove_docker_container", mock_raising_cleanup)
+
+    class MockTimeoutProc:
+        def __init__(self):
+            self.pid = 4321
+            self.killed = False
+
+        def poll(self):
+            return -9 if self.killed else None
+
+        def wait(self, timeout=None):
+            if timeout is not None and not self.killed:
+                raise subprocess.TimeoutExpired(cmd="docker", timeout=timeout)
+            return -9
+
+        def kill(self):
+            self.killed = True
+
+    proc_instance = MockTimeoutProc()
+    monkeypatch.setattr(subprocess, "Popen", lambda *args, **kwargs: proc_instance)
+
+    executor = SandboxExecutor(backend="docker")
+    success, error_msg = executor.execute("result = 1", sample_df, timeout_seconds=1.0)
+
+    # 1. Primary timeout failure preserved
+    assert success is False
+    assert "timed out after 1.0 seconds" in error_msg.lower()
+
+    # 2. Cleanup error surfaced without crashing the executor
+    assert "cleanup warning" in error_msg.lower()
+    assert "unexpected daemon socket crash" in error_msg.lower()
+
+
+def test_docker_successful_run_remains_successful(sample_df, monkeypatch):
+    """
+    [UNIT TEST]
+    Verifies that a successful execution path (clean exit code 0) remains fully successful,
+    returning (True, result) without spurious cleanup warnings.
+    """
+    monkeypatch.setattr(sandbox, "_is_docker_available", lambda: True)
+    monkeypatch.setattr(sandbox, "_kill_and_remove_docker_container", lambda name: (True, ""))
+
+    class MockCleanProc:
+        def __init__(self):
+            self.returncode = 0
+            self.pid = 9999
+
+        def poll(self):
+            return 0
+
+        def wait(self, timeout=None):
+            return 0
+
+    def mock_clean_popen(*args, **kwargs):
+        out_mount = next((arg for arg in args[0] if ":/workspace/ipc/out" in arg), None)
+        out_dir = out_mount.split(":/workspace/ipc/out")[0] if out_mount else args[0][args[0].index("--out-dir") + 1]
+        resp_file = os.path.join(out_dir, "response.json")
+        with open(resp_file, "w", encoding="utf-8") as f:
+            json.dump({
+                "version": "1.0",
+                "status": "success",
+                "result_type": "int",
+                "has_arrow_data": False,
+                "scalar_value": 42
+            }, f)
+        return MockCleanProc()
+
+    monkeypatch.setattr(subprocess, "Popen", mock_clean_popen)
+
+    executor = SandboxExecutor(backend="docker")
+    success, res = executor.execute("result = 42", sample_df)
+
+    assert success is True
+    assert res == 42
+
+
+def test_cleanup_warning_ordering_proof_finally_to_return(sample_df, monkeypatch):
+    """
+    [UNIT TEST - RETURN-ORDERING LIFECYCLE PROOF]
+    Proves that cleanup warnings collected during the `finally:` block reach the final
+    returned diagnostic across both timeout and nonzero-exit paths, establishing that:
+      1. Container termination, subprocess reaping, and cleanup execution occur in `finally:`
+      2. The final diagnostic is formatted strictly AFTER `finally:` has populated cleanup_errors
+      3. The primary execution failure remains unmasked as the leading diagnostic
+    """
+    events = []
+
+    def mock_cleanup(name):
+        events.append("container_cleanup_invoked")
+        return (False, "docker rm error: daemon communication lost")
+
+    monkeypatch.setattr(sandbox, "_is_docker_available", lambda: True)
+    monkeypatch.setattr(sandbox, "_kill_and_remove_docker_container", mock_cleanup)
+
+    # --- Scenario 1: Timeout path ---
+    class MockTimeoutProc:
+        def __init__(self):
+            self.pid = 7171
+            self.killed = False
+
+        def poll(self):
+            return -9 if self.killed else None
+
+        def wait(self, timeout=None):
+            if timeout is not None and not self.killed:
+                events.append("proc_wait_timeout")
+                raise subprocess.TimeoutExpired(cmd="docker", timeout=timeout)
+            events.append("proc_reaped")
+            return -9
+
+        def kill(self):
+            events.append("proc_kill")
+            self.killed = True
+
+    proc_timeout = MockTimeoutProc()
+    monkeypatch.setattr(subprocess, "Popen", lambda *args, **kwargs: proc_timeout)
+
+    executor = SandboxExecutor(backend="docker")
+    success_t, error_msg_t = executor.execute("result = 1", sample_df, timeout_seconds=1.0)
+    events.append("timeout_return_received")
+
+    # Verify strict lifecycle order
+    assert events == [
+        "proc_wait_timeout",
+        "proc_kill",
+        "proc_reaped",
+        "container_cleanup_invoked",
+        "timeout_return_received",
+    ]
+    assert success_t is False
+    assert "timed out after 1.0 seconds" in error_msg_t.lower()
+    assert "cleanup warning" in error_msg_t.lower()
+    assert "daemon communication lost" in error_msg_t.lower()
+
+    # --- Scenario 2: Nonzero exit path ---
+    events.clear()
+
+    class MockNonZeroProc:
+        def __init__(self):
+            self.returncode = 1
+            self.pid = 7172
+
+        def poll(self):
+            return 1
+
+        def wait(self, timeout=None):
+            events.append("proc_wait_code_1")
+            return 1
+
+    monkeypatch.setattr(subprocess, "Popen", lambda *args, **kwargs: MockNonZeroProc())
+
+    success_nz, error_msg_nz = executor.execute("result = 1", sample_df)
+    events.append("nonzero_return_received")
+
+    # Verify strict lifecycle order for abnormal exit
+    assert events == [
+        "proc_wait_code_1",
+        "container_cleanup_invoked",
+        "nonzero_return_received",
+    ]
+    assert success_nz is False
+    assert "exited with code 1" in error_msg_nz.lower()
+    assert "cleanup warning" in error_msg_nz.lower()
+    assert "daemon communication lost" in error_msg_nz.lower()
