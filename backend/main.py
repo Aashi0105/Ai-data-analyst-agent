@@ -31,6 +31,14 @@ from agent import DataAnalystAgent
 from validator import clean_code, validate_code
 from sandbox import execute_pandas_code, SandboxExecutor
 from backend.chart_utils import build_recharts_data
+from backend.store import (
+    BoundedDatasetStore,
+    StoredDataset,
+    DatasetNotFoundError,
+    DatasetSessionExpiredError,
+    DatasetInUseError,
+    StorageCapacityExhaustedError,
+)
 
 # ============================================================================
 # Upload Constraints
@@ -40,11 +48,16 @@ MAX_UPLOAD_SIZE_BYTES = MAX_UPLOAD_SIZE_MB * 1024 * 1024  # 26,214,400 bytes
 UPLOAD_CHUNK_SIZE_BYTES = 1024 * 1024  # 1 MiB chunk reading
 
 # ============================================================================
-# In-Memory Dataset Store
-# NOTE: Server-memory based session storage. Suitable for development/demo.
-# Not persistent across server restarts or multi-instance deployments.
+# Bounded In-Memory Dataset Store
+# NOTE: Thread-safe, memory-bounded, TTL-aware session storage with LRU eviction.
+# Architectural limitation: Single-worker Uvicorn deployment only (--workers 1).
+# Multi-worker deployments require an external distributed cache (e.g. Redis).
 # ============================================================================
-DATASET_STORE: Dict[str, Dict[str, Any]] = {}
+DATASET_STORE = BoundedDatasetStore(
+    max_datasets=int(os.getenv("DATASET_STORE_MAX_DATASETS", "15")),
+    max_memory_bytes=int(os.getenv("DATASET_STORE_MAX_MEMORY_MB", "512")) * 1024 * 1024,
+    ttl_seconds=float(os.getenv("DATASET_STORE_TTL_SECONDS", "3600.0")),
+)
 
 # FastAPI App Initialization
 app = FastAPI(
@@ -96,6 +109,12 @@ class DatasetMetadataResponse(BaseModel):
     dtypes: Dict[str, str]
     schema_info: List[ColumnSchema] = Field(..., serialization_alias="schema")
     preview: List[Dict[str, Any]]
+
+
+class DeleteDatasetResponse(BaseModel):
+    status: str = "deleted"
+    dataset_id: str
+    message: str = "Dataset successfully removed from memory."
 
 
 class AnalyzeRequest(BaseModel):
@@ -238,11 +257,13 @@ async def upload_dataset(request: Request, file: UploadFile = File(...)) -> Data
         await file.close()
 
     dataset_id = str(uuid.uuid4())
-    DATASET_STORE[dataset_id] = {
-        "df": df,
-        "filename": file.filename,
-        "uploaded_at": time.strftime("%Y-%m-%d %H:%M:%S")
-    }
+    try:
+        DATASET_STORE.put(dataset_id, df, file.filename)
+    except StorageCapacityExhaustedError as e:
+        raise HTTPException(
+            status_code=503,
+            detail=f"Storage capacity temporarily exhausted: {str(e)}"
+        )
 
     return _format_dataset_response(dataset_id, file.filename, df)
 
@@ -252,34 +273,73 @@ def load_sample_dataset() -> DatasetMetadataResponse:
     """
     Loads the bundled synthetic evaluation benchmark dataset (data/ecommerce_sales.csv)
     for instant one-click demonstration.
+    Prevents unbounded retention and race conditions by atomically reusing an unexpired sample.
+    Avoids holding the store lock during CSV disk I/O.
     """
+    # Fast-path check for existing unexpired sample without disk I/O
+    existing = DATASET_STORE.get_sample()
+    if existing is not None:
+        return _format_dataset_response(existing.dataset_id, existing.filename, existing.df)
+
     sample_path = os.path.join(WORKSPACE_ROOT, "data", "ecommerce_sales.csv")
     if not os.path.exists(sample_path):
         raise HTTPException(status_code=404, detail="Sample dataset not found on server.")
 
+    # Disk I/O performed outside store lock
     try:
         df = load_csv(sample_path)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to load sample dataset: {str(e)}")
 
-    dataset_id = str(uuid.uuid4())
-    DATASET_STORE[dataset_id] = {
-        "df": df,
-        "filename": "ecommerce_sales.csv (Sample)",
-        "uploaded_at": time.strftime("%Y-%m-%d %H:%M:%S")
-    }
+    filename = "ecommerce_sales.csv (Sample)"
+    try:
+        stored = DATASET_STORE.put_or_reuse_sample(df, filename)
+    except StorageCapacityExhaustedError as e:
+        raise HTTPException(
+            status_code=503,
+            detail=f"Storage capacity temporarily exhausted: {str(e)}"
+        )
 
-    return _format_dataset_response(dataset_id, "ecommerce_sales.csv (Sample)", df)
+    return _format_dataset_response(stored.dataset_id, stored.filename, stored.df)
 
 
 @app.get("/api/datasets/{dataset_id}", response_model=DatasetMetadataResponse)
 def get_dataset(dataset_id: str) -> DatasetMetadataResponse:
     """Retrieves dataset summary and schema for an active session."""
-    if dataset_id not in DATASET_STORE:
+    try:
+        stored = DATASET_STORE.get(dataset_id)
+        return _format_dataset_response(dataset_id, stored.filename, stored.df)
+    except DatasetSessionExpiredError:
+        raise HTTPException(status_code=404, detail="Dataset session expired. Please re-upload your CSV.")
+    except DatasetNotFoundError:
         raise HTTPException(status_code=404, detail=f"Dataset with ID '{dataset_id}' was not found in server memory.")
 
-    stored = DATASET_STORE[dataset_id]
-    return _format_dataset_response(dataset_id, stored["filename"], stored["df"])
+
+@app.delete("/api/datasets/{dataset_id}", response_model=DeleteDatasetResponse)
+def delete_dataset(dataset_id: str) -> DeleteDatasetResponse:
+    """
+    Explicitly frees an in-memory dataset session.
+    Returns HTTP 409 Conflict if dataset is currently undergoing active analysis.
+    Returns HTTP 404 Not Found if dataset does not exist or has expired.
+    """
+    try:
+        DATASET_STORE.delete(dataset_id)
+        return DeleteDatasetResponse(dataset_id=dataset_id)
+    except DatasetInUseError as e:
+        raise HTTPException(
+            status_code=409,
+            detail=str(e)
+        )
+    except DatasetSessionExpiredError:
+        raise HTTPException(
+            status_code=404,
+            detail="Dataset session expired. Please re-upload your CSV."
+        )
+    except DatasetNotFoundError:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Dataset with ID '{dataset_id}' was not found in server memory."
+        )
 
 
 @app.post("/api/analyze", response_model=AnalyzeResponse)
@@ -288,142 +348,151 @@ def analyze_data(request: AnalyzeRequest) -> AnalyzeResponse:
     Translates a plain-English question into Pandas code, runs AST safety verification,
     executes inside the isolated sandbox, and formats results & Recharts visualization data.
     """
-    if request.dataset_id not in DATASET_STORE:
-        raise HTTPException(status_code=404, detail=f"Dataset '{request.dataset_id}' not found. Please upload a CSV first.")
-
-    df = DATASET_STORE[request.dataset_id]["df"]
-    user_question = request.question.strip()
-
-    start_time = time.time()
-    generated_code = ""
-
-    # Stage 1: Generate Code using existing DataAnalystAgent
     try:
-        agent = DataAnalystAgent()
-        generated_code = agent.generate_code(df, user_question)
-        cleaned_code = clean_code(generated_code)
-    except Exception as e:
-        elapsed_ms = int((time.time() - start_time) * 1000)
-        err_str = str(e)
-        
-        # Detect Gemini quota / rate limit exhaustion (HTTP 429 / RESOURCE_EXHAUSTED)
-        is_quota = any(marker in err_str for marker in [
-            "429", "RESOURCE_EXHAUSTED", "GenerateRequestsPerDay", "ResourceExhausted", "quota", "usage limit"
-        ])
-        if is_quota:
-            return JSONResponse(
-                status_code=429,
-                content={
-                    "error": "quota_exceeded",
-                    "message": "AI analysis is temporarily unavailable because the current API usage limit has been reached.",
-                    "retryable": False
-                }
+        with DATASET_STORE.acquire_active(request.dataset_id) as df:
+            user_question = request.question.strip()
+
+            start_time = time.time()
+            generated_code = ""
+
+            # Stage 1: Generate Code using existing DataAnalystAgent
+            try:
+                agent = DataAnalystAgent()
+                generated_code = agent.generate_code(df, user_question)
+                cleaned_code = clean_code(generated_code)
+            except Exception as e:
+                elapsed_ms = int((time.time() - start_time) * 1000)
+                err_str = str(e)
+
+                # Detect Gemini quota / rate limit exhaustion (HTTP 429 / RESOURCE_EXHAUSTED)
+                is_quota = any(marker in err_str for marker in [
+                    "429", "RESOURCE_EXHAUSTED", "GenerateRequestsPerDay", "ResourceExhausted", "quota", "usage limit"
+                ])
+                if is_quota:
+                    return JSONResponse(
+                        status_code=429,
+                        content={
+                            "error": "quota_exceeded",
+                            "message": "AI analysis is temporarily unavailable because the current API usage limit has been reached.",
+                            "retryable": False
+                        }
+                    )
+
+                sanitized = _sanitize_error_message(err_str)
+                return AnalyzeResponse(
+                    question=user_question,
+                    code=generated_code,
+                    validation_status="failed",
+                    validation_message="Code generation failed.",
+                    execution_status="failed",
+                    error_message=f"Code generation error: {sanitized}",
+                    execution_time_ms=elapsed_ms
+                )
+
+            # Stage 2: AST Validation
+            is_valid, validation_msg = validate_code(cleaned_code)
+            if not is_valid:
+                elapsed_ms = int((time.time() - start_time) * 1000)
+                return AnalyzeResponse(
+                    question=user_question,
+                    code=cleaned_code,
+                    validation_status="failed",
+                    validation_message=validation_msg,
+                    execution_status="failed",
+                    error_message=f"AST Security Violation: {validation_msg}",
+                    execution_time_ms=elapsed_ms
+                )
+
+            # Stage 3: Sandbox Execution (on deep copy)
+            exec_success, result_or_error = execute_pandas_code(cleaned_code, df)
+            elapsed_ms = int((time.time() - start_time) * 1000)
+
+            if not exec_success:
+                return AnalyzeResponse(
+                    question=user_question,
+                    code=cleaned_code,
+                    validation_status="passed",
+                    validation_message="Code passed AST validation.",
+                    execution_status="failed",
+                    error_message=str(result_or_error),
+                    execution_time_ms=elapsed_ms
+                )
+
+            # Stage 4: Structure Output and Visualization Data
+            res = result_or_error
+            result_type = "scalar"
+            formatted_result = ""
+            table_data = None
+            viz_data = None
+
+            if isinstance(res, (int, float, str, bool, np.number, np.bool_)):
+                result_type = "scalar"
+                formatted_result = format_value(res)
+
+            elif isinstance(res, pd.DataFrame):
+                result_type = "dataframe"
+                formatted_result = f"Showing {len(res)} results."
+                clean_df = res.head(50).replace({np.nan: None})
+                table_data = TableData(
+                    columns=[str(c) for c in res.columns],
+                    rows=clean_df.to_dict(orient="records")
+                )
+                # Attempt to build structured chart data
+                recharts_obj = build_recharts_data(res)
+                if recharts_obj:
+                    viz_data = VisualizationData(**recharts_obj)
+
+            elif isinstance(res, pd.Series):
+                result_type = "series"
+                formatted_result = f"Showing {len(res)} items."
+                index_col = str(res.index.name or "Category")
+                val_col = str(res.name or "Value")
+                rows = []
+                for idx, val in res.head(50).items():
+                    clean_val = None if pd.isnull(val) else (round(float(val), 2) if isinstance(val, (float, np.floating)) else val)
+                    rows.append({index_col: str(idx), val_col: clean_val})
+                table_data = TableData(columns=[index_col, val_col], rows=rows)
+
+                recharts_obj = build_recharts_data(res)
+                if recharts_obj:
+                    viz_data = VisualizationData(**recharts_obj)
+
+            elif isinstance(res, dict):
+                result_type = "dict"
+                formatted_result = f"{len(res)} keys returned."
+                rows = [{"Key": str(k), "Value": str(v)} for k, v in res.items()]
+                table_data = TableData(columns=["Key", "Value"], rows=rows)
+
+            elif isinstance(res, (list, tuple, set)):
+                result_type = "list"
+                formatted_result = f"List of {len(res)} items."
+                rows = [{"Item": str(item)} for item in list(res)[:50]]
+                table_data = TableData(columns=["Item"], rows=rows)
+
+            else:
+                result_type = "other"
+                formatted_result = str(res)
+
+            return AnalyzeResponse(
+                question=user_question,
+                code=cleaned_code,
+                validation_status="passed",
+                validation_message="Code passed AST validation.",
+                execution_status="passed",
+                result_type=result_type,
+                formatted_result=formatted_result,
+                table_data=table_data,
+                visualization=viz_data,
+                execution_time_ms=elapsed_ms
             )
 
-        sanitized = _sanitize_error_message(err_str)
-        return AnalyzeResponse(
-            question=user_question,
-            code=generated_code,
-            validation_status="failed",
-            validation_message="Code generation failed.",
-            execution_status="failed",
-            error_message=f"Code generation error: {sanitized}",
-            execution_time_ms=elapsed_ms
+    except DatasetSessionExpiredError:
+        raise HTTPException(
+            status_code=404,
+            detail="Dataset session expired. Please re-upload your CSV."
         )
-
-    # Stage 2: AST Validation
-    is_valid, validation_msg = validate_code(cleaned_code)
-    if not is_valid:
-        elapsed_ms = int((time.time() - start_time) * 1000)
-        return AnalyzeResponse(
-            question=user_question,
-            code=cleaned_code,
-            validation_status="failed",
-            validation_message=validation_msg,
-            execution_status="failed",
-            error_message=f"AST Security Violation: {validation_msg}",
-            execution_time_ms=elapsed_ms
+    except DatasetNotFoundError:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Dataset '{request.dataset_id}' not found. Please upload a CSV first."
         )
-
-    # Stage 3: Sandbox Execution (on deep copy)
-    exec_success, result_or_error = execute_pandas_code(cleaned_code, df)
-    elapsed_ms = int((time.time() - start_time) * 1000)
-
-    if not exec_success:
-        return AnalyzeResponse(
-            question=user_question,
-            code=cleaned_code,
-            validation_status="passed",
-            validation_message="Code passed AST validation.",
-            execution_status="failed",
-            error_message=str(result_or_error),
-            execution_time_ms=elapsed_ms
-        )
-
-    # Stage 4: Structure Output and Visualization Data
-    res = result_or_error
-    result_type = "scalar"
-    formatted_result = ""
-    table_data = None
-    viz_data = None
-
-    if isinstance(res, (int, float, str, bool, np.number, np.bool_)):
-        result_type = "scalar"
-        formatted_result = format_value(res)
-
-    elif isinstance(res, pd.DataFrame):
-        result_type = "dataframe"
-        formatted_result = f"Showing {len(res)} results."
-        clean_df = res.head(50).replace({np.nan: None})
-        table_data = TableData(
-            columns=[str(c) for c in res.columns],
-            rows=clean_df.to_dict(orient="records")
-        )
-        # Attempt to build structured chart data
-        recharts_obj = build_recharts_data(res)
-        if recharts_obj:
-            viz_data = VisualizationData(**recharts_obj)
-
-    elif isinstance(res, pd.Series):
-        result_type = "series"
-        formatted_result = f"Showing {len(res)} items."
-        index_col = str(res.index.name or "Category")
-        val_col = str(res.name or "Value")
-        rows = []
-        for idx, val in res.head(50).items():
-            clean_val = None if pd.isnull(val) else (round(float(val), 2) if isinstance(val, (float, np.floating)) else val)
-            rows.append({index_col: str(idx), val_col: clean_val})
-        table_data = TableData(columns=[index_col, val_col], rows=rows)
-
-        recharts_obj = build_recharts_data(res)
-        if recharts_obj:
-            viz_data = VisualizationData(**recharts_obj)
-
-    elif isinstance(res, dict):
-        result_type = "dict"
-        formatted_result = f"{len(res)} keys returned."
-        rows = [{"Key": str(k), "Value": str(v)} for k, v in res.items()]
-        table_data = TableData(columns=["Key", "Value"], rows=rows)
-
-    elif isinstance(res, (list, tuple, set)):
-        result_type = "list"
-        formatted_result = f"List of {len(res)} items."
-        rows = [{"Item": str(item)} for item in list(res)[:50]]
-        table_data = TableData(columns=["Item"], rows=rows)
-
-    else:
-        result_type = "other"
-        formatted_result = str(res)
-
-    return AnalyzeResponse(
-        question=user_question,
-        code=cleaned_code,
-        validation_status="passed",
-        validation_message="Code passed AST validation.",
-        execution_status="passed",
-        result_type=result_type,
-        formatted_result=formatted_result,
-        table_data=table_data,
-        visualization=viz_data,
-        execution_time_ms=elapsed_ms
-    )

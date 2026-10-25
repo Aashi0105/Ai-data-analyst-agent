@@ -232,3 +232,557 @@ def test_analyze_quota_exceeded_structured_error(client, monkeypatch):
     # Verify no secret key or stack trace dump leaked
     assert "AIzaSyFakeKey12345" not in response.text
     assert "Traceback" not in response.text
+
+
+# ============================================================================
+# Bounded Dataset Storage Tests (Task 08A.2.2 & 08A.2.3)
+# ============================================================================
+
+def test_repeated_sample_dataset_does_not_duplicate_retention(client):
+    """Verify repeated sequential requests for sample dataset reuse existing entry and prevent unbounded growth."""
+    import backend.main as backend_main
+    backend_main.DATASET_STORE.clear()
+
+    res1 = client.post("/api/datasets/sample")
+    assert res1.status_code == 200
+    id1 = res1.json()["dataset_id"]
+
+    res2 = client.post("/api/datasets/sample")
+    assert res2.status_code == 200
+    id2 = res2.json()["dataset_id"]
+
+    # Reuses existing unexpired sample dataset
+    assert id1 == id2
+    assert len(backend_main.DATASET_STORE) == 1
+
+
+def test_repeated_and_concurrent_sample_dataset_requests(client):
+    """Verify concurrent requests for sample dataset atomically reuse identical instance without race conditions."""
+    import threading
+    import backend.main as backend_main
+    backend_main.DATASET_STORE.clear()
+
+    results = []
+    errors = []
+
+    def load_worker():
+        try:
+            res = client.post("/api/datasets/sample")
+            assert res.status_code == 200
+            results.append(res.json()["dataset_id"])
+        except Exception as e:
+            errors.append(e)
+
+    threads = [threading.Thread(target=load_worker) for _ in range(10)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert len(errors) == 0
+    assert len(results) == 10
+    # Every concurrent thread must receive the exact same dataset ID
+    assert len(set(results)) == 1
+    # Exactly one sample dataset retained in memory
+    assert len(backend_main.DATASET_STORE) == 1
+
+
+def test_delete_dataset_success(client):
+    """Verify DELETE /api/datasets/{id} frees dataset and subsequent GET returns 404."""
+    csv_content = b"col1,col2\nval1,10\nval2,20"
+    upload_res = client.post(
+        "/api/datasets/upload",
+        files={"file": ("to_delete.csv", io.BytesIO(csv_content), "text/csv")}
+    )
+    assert upload_res.status_code == 200
+    ds_id = upload_res.json()["dataset_id"]
+
+    # Delete dataset
+    del_res = client.delete(f"/api/datasets/{ds_id}")
+    assert del_res.status_code == 200
+    del_data = del_res.json()
+    assert del_data["status"] == "deleted"
+    assert del_data["dataset_id"] == ds_id
+
+    # Subsequent GET returns 404
+    get_res = client.get(f"/api/datasets/{ds_id}")
+    assert get_res.status_code == 404
+
+
+def test_delete_nonexistent_dataset(client):
+    """Verify DELETE /api/datasets/{id} returns 404 for unknown dataset ID."""
+    del_res = client.delete("/api/datasets/nonexistent-uuid-99999")
+    assert del_res.status_code == 404
+
+
+def test_delete_dataset_conflict_during_active_analysis(client):
+    """Verify deletion attempt during active analysis returns HTTP 409 Conflict."""
+    import backend.main as backend_main
+    csv_content = b"col1,col2\nval1,10\nval2,20"
+    upload_res = client.post(
+        "/api/datasets/upload",
+        files={"file": ("in_use.csv", io.BytesIO(csv_content), "text/csv")}
+    )
+    ds_id = upload_res.json()["dataset_id"]
+
+    with backend_main.DATASET_STORE.acquire_active(ds_id):
+        del_res = client.delete(f"/api/datasets/{ds_id}")
+        assert del_res.status_code == 409
+        assert "currently being analyzed" in del_res.json()["detail"].lower()
+
+    # Once released, deletion succeeds
+    del_res_after = client.delete(f"/api/datasets/{ds_id}")
+    assert del_res_after.status_code == 200
+
+
+def test_active_reference_released_on_success_and_exception():
+    """Verify active analysis references are safely released on both normal return and exception."""
+    from backend.store import BoundedDatasetStore
+    store = BoundedDatasetStore(max_datasets=5)
+    df = pd.DataFrame({"a": [1, 2, 3]})
+    store.put("ds1", df, "test.csv")
+
+    assert store["ds1"].active_queries == 0
+
+    # Normal exit
+    with store.acquire_active("ds1") as active_df:
+        assert active_df is not None
+        assert store["ds1"].active_queries == 1
+
+    assert store["ds1"].active_queries == 0
+
+    # Exception exit
+    try:
+        with store.acquire_active("ds1"):
+            assert store["ds1"].active_queries == 1
+            raise RuntimeError("simulated pipeline error")
+    except RuntimeError:
+        pass
+
+    assert store["ds1"].active_queries == 0
+
+
+def test_lru_eviction_at_item_limit(client, monkeypatch):
+    """Verify least-recently-used inactive datasets are evicted when max_datasets limit is reached."""
+    import backend.main as backend_main
+    monkeypatch.setattr(backend_main.DATASET_STORE, "max_datasets", 3)
+    backend_main.DATASET_STORE.clear()
+
+    # Upload 3 datasets
+    ids = []
+    for i in range(1, 4):
+        res = client.post(
+            "/api/datasets/upload",
+            files={"file": (f"data_{i}.csv", io.BytesIO(f"col\n{i}".encode()), "text/csv")}
+        )
+        assert res.status_code == 200
+        ids.append(res.json()["dataset_id"])
+
+    # Access dataset 0 (making it most recently used; dataset 1 is now LRU)
+    get_res = client.get(f"/api/datasets/{ids[0]}")
+    assert get_res.status_code == 200
+
+    # Upload 4th dataset -> must evict dataset 1 (LRU)
+    res4 = client.post(
+        "/api/datasets/upload",
+        files={"file": ("data_4.csv", io.BytesIO(b"col\n4"), "text/csv")}
+    )
+    assert res4.status_code == 200
+    id4 = res4.json()["dataset_id"]
+
+    # Verify dataset 1 (index 1) was evicted
+    assert client.get(f"/api/datasets/{ids[1]}").status_code == 404
+    # Verify dataset 0, 2, and 4 are still present
+    assert client.get(f"/api/datasets/{ids[0]}").status_code == 200
+    assert client.get(f"/api/datasets/{ids[2]}").status_code == 200
+    assert client.get(f"/api/datasets/{id4}").status_code == 200
+
+
+def test_aggregate_memory_limit_eviction():
+    """Verify store evicts inactive LRU dataset when aggregate memory exceeds threshold."""
+    from backend.store import BoundedDatasetStore
+    df = pd.DataFrame({"col": range(100)})
+    single_mem = BoundedDatasetStore.estimate_dataframe_memory(df)
+
+    # Set capacity enough for 2 datasets, but not 3
+    store = BoundedDatasetStore(
+        max_datasets=10,
+        max_memory_bytes=single_mem * 2 + 100
+    )
+
+    store.put("ds1", df, "ds1.csv")
+    store.put("ds2", df, "ds2.csv")
+    assert len(store) == 2
+    assert "ds1" in store
+    assert "ds2" in store
+
+    # Putting ds3 must evict ds1 to stay within memory ceiling
+    store.put("ds3", df, "ds3.csv")
+    assert len(store) == 2
+    assert "ds1" not in store
+    assert "ds2" in store
+    assert "ds3" in store
+    assert store.total_memory_bytes <= store.max_memory_bytes
+
+
+def test_ttl_expiration_with_mock_time(client, monkeypatch):
+    """Verify datasets past idle TTL are expired and return 404 with session expired message."""
+    import backend.main as backend_main
+    backend_main.DATASET_STORE.clear()
+
+    current_time = [1000.0]
+    monkeypatch.setattr(backend_main.DATASET_STORE, "_time_provider", lambda: current_time[0])
+
+    res = client.post(
+        "/api/datasets/upload",
+        files={"file": ("expiring.csv", io.BytesIO(b"col\n100"), "text/csv")}
+    )
+    assert res.status_code == 200
+    ds_id = res.json()["dataset_id"]
+
+    # Immediately accessible
+    assert client.get(f"/api/datasets/{ds_id}").status_code == 200
+
+    # Advance time beyond 1-hour TTL (3600 seconds)
+    current_time[0] += 3605.0
+
+    # Request after TTL expiration
+    expired_res = client.get(f"/api/datasets/{ds_id}")
+    assert expired_res.status_code == 404
+    assert "session expired" in expired_res.json()["detail"].lower()
+
+
+def test_active_analysis_prevents_eviction():
+    """Verify an active dataset cannot be evicted even if it is the oldest item in store."""
+    from backend.store import BoundedDatasetStore
+    store = BoundedDatasetStore(max_datasets=2)
+    df = pd.DataFrame({"col": [1, 2, 3]})
+
+    store.put("ds1", df, "ds1.csv")
+    store.put("ds2", df, "ds2.csv")
+
+    # Mark ds1 as active
+    with store.acquire_active("ds1"):
+        # Put ds3: capacity limit reached (max_datasets=2).
+        # Since ds1 is active, ds2 (inactive) must be evicted instead of ds1!
+        store.put("ds3", df, "ds3.csv")
+        assert "ds1" in store
+        assert "ds2" not in store
+        assert "ds3" in store
+
+
+def test_capacity_exhaustion_when_all_candidates_active(client, monkeypatch):
+    """Verify upload returns HTTP 503 when all stored datasets are active and cannot be evicted."""
+    import backend.main as backend_main
+    monkeypatch.setattr(backend_main.DATASET_STORE, "max_datasets", 2)
+    backend_main.DATASET_STORE.clear()
+
+    res1 = client.post(
+        "/api/datasets/upload",
+        files={"file": ("data_1.csv", io.BytesIO(b"col\n1"), "text/csv")}
+    )
+    res2 = client.post(
+        "/api/datasets/upload",
+        files={"file": ("data_2.csv", io.BytesIO(b"col\n2"), "text/csv")}
+    )
+    id1 = res1.json()["dataset_id"]
+    id2 = res2.json()["dataset_id"]
+
+    # Hold active locks on both retained datasets
+    with backend_main.DATASET_STORE.acquire_active(id1):
+        with backend_main.DATASET_STORE.acquire_active(id2):
+            res3 = client.post(
+                "/api/datasets/upload",
+                files={"file": ("data_3.csv", io.BytesIO(b"col\n3"), "text/csv")}
+            )
+            assert res3.status_code == 503
+            assert "capacity temporarily exhausted" in res3.json()["detail"].lower()
+
+
+def test_oversized_dataset_rejected_without_modifying_store():
+    """Verify dataset larger than max_memory_bytes is rejected without altering existing store contents."""
+    from backend.store import BoundedDatasetStore, StorageCapacityExhaustedError
+    df_small = pd.DataFrame({"col": [1, 2]})
+    small_mem = BoundedDatasetStore.estimate_dataframe_memory(df_small)
+
+    store = BoundedDatasetStore(max_datasets=5, max_memory_bytes=small_mem * 3)
+    store.put("valid1", df_small, "small.csv")
+    initial_mem = store.total_memory_bytes
+    assert len(store) == 1
+
+    df_oversized = pd.DataFrame({"col": range(10000)})
+    assert BoundedDatasetStore.estimate_dataframe_memory(df_oversized) > store.max_memory_bytes
+
+    try:
+        store.put("oversized", df_oversized, "large.csv")
+        assert False, "Should have raised StorageCapacityExhaustedError"
+    except StorageCapacityExhaustedError:
+        pass
+
+    # Ensure store was untouched
+    assert len(store) == 1
+    assert "valid1" in store
+    assert store.total_memory_bytes == initial_mem
+
+
+def test_failed_insertion_does_not_evict_existing_valid_datasets():
+    """Verify that if an insertion cannot succeed, zero existing datasets are evicted speculatively."""
+    from backend.store import BoundedDatasetStore, StorageCapacityExhaustedError
+    df = pd.DataFrame({"col": range(50)})
+    mem = BoundedDatasetStore.estimate_dataframe_memory(df)
+
+    # Store with max 2 datasets, memory for 2 datasets
+    store = BoundedDatasetStore(max_datasets=2, max_memory_bytes=mem * 2 + 50)
+    store.put("active_ds", df, "active.csv")
+    store.put("inactive_ds", df, "inactive.csv")
+
+    with store.acquire_active("active_ds"):
+        # Attempt to insert a dataset that requires more memory than can be obtained by evicting inactive_ds
+        df_large = pd.DataFrame({"col": range(150)})
+        large_mem = BoundedDatasetStore.estimate_dataframe_memory(df_large)
+        assert large_mem + mem > store.max_memory_bytes
+
+        try:
+            store.put("new_ds", df_large, "new.csv")
+            assert False, "Should have raised StorageCapacityExhaustedError"
+        except StorageCapacityExhaustedError:
+            pass
+
+        # Inactive dataset must NOT have been speculatively evicted!
+        assert "active_ds" in store
+        assert "inactive_ds" in store
+        assert len(store) == 2
+
+
+def test_memory_accounting_after_delete_and_expiration():
+    """Verify total_memory_bytes accurately tracks allocations through insertion, deletion, and TTL expiration."""
+    from backend.store import BoundedDatasetStore
+    clock = [100.0]
+    store = BoundedDatasetStore(max_datasets=5, ttl_seconds=50.0, time_provider=lambda: clock[0])
+
+    df1 = pd.DataFrame({"a": [1, 2, 3]})
+    df2 = pd.DataFrame({"b": [4, 5, 6, 7, 8]})
+    m1 = store.estimate_dataframe_memory(df1)
+    m2 = store.estimate_dataframe_memory(df2)
+
+    store.put("ds1", df1, "f1.csv")
+    assert store.total_memory_bytes == m1
+
+    store.put("ds2", df2, "f2.csv")
+    assert store.total_memory_bytes == (m1 + m2)
+
+    # Delete ds1
+    store.delete("ds1")
+    assert store.total_memory_bytes == m2
+
+    # Expire ds2 by advancing clock
+    clock[0] += 60.0
+    # Lazy expiration on count or access
+    assert len(store) == 0
+    assert store.total_memory_bytes == 0
+
+
+def test_concurrent_store_access():
+    """Verify thread-safe concurrent reads and writes do not corrupt internal store state."""
+    import threading
+    from backend.store import BoundedDatasetStore
+
+    store = BoundedDatasetStore(max_datasets=10, max_memory_bytes=10 * 1024 * 1024)
+    errors = []
+
+    def worker(worker_id: int):
+        try:
+            df = pd.DataFrame({"col": range(50)})
+            ds_id = f"ds_{worker_id}"
+            store.put(ds_id, df, f"worker_{worker_id}.csv")
+            with store.acquire_active(ds_id) as active_df:
+                assert len(active_df) == 50
+            item = store.get(ds_id)
+            assert item.filename == f"worker_{worker_id}.csv"
+        except Exception as e:
+            errors.append(e)
+
+    threads = [threading.Thread(target=worker, args=(i,)) for i in range(10)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert len(errors) == 0
+    assert len(store) <= 10
+
+
+def test_dictionary_compatibility_protocol():
+    """Verify BoundedDatasetStore satisfies dict interface: len, in, get, pop, copy, iteration, KeyError."""
+    from backend.store import BoundedDatasetStore
+    store = BoundedDatasetStore(max_datasets=5)
+    df = pd.DataFrame({"x": [10, 20]})
+
+    store["d1"] = {"df": df, "filename": "data.csv"}
+    assert len(store) == 1
+    assert "d1" in store
+    assert "d_missing" not in store
+    assert bool(store) is True
+
+    # Subscript access
+    item = store["d1"]
+    assert item["filename"] == "data.csv"
+    assert "df" in item
+    assert "filename" in item.keys()
+
+    # get with default
+    assert store.get("missing", "fallback") == "fallback"
+
+    # copy snapshot
+    snap = store.copy()
+    assert isinstance(snap, dict)
+    assert "d1" in snap
+
+    # pop
+    popped = store.pop("d1")
+    assert popped.filename == "data.csv"
+    assert len(store) == 0
+    assert bool(store) is False
+
+    # pop missing with default
+    assert store.pop("missing", None) is None
+
+    # Missing subscript raises KeyError
+    try:
+        _ = store["missing"]
+        assert False, "Should raise KeyError"
+    except KeyError:
+        pass
+
+
+def test_clear_refuses_when_datasets_active():
+    """Verify clear() refuses to clear store when active queries are running, preventing query invalidation."""
+    from backend.store import BoundedDatasetStore, DatasetInUseError
+    store = BoundedDatasetStore(max_datasets=5)
+    df = pd.DataFrame({"col": [1, 2, 3]})
+    store.put("active_ds", df, "active.csv")
+
+    with store.acquire_active("active_ds"):
+        try:
+            store.clear()
+            assert False, "Should raise DatasetInUseError"
+        except DatasetInUseError:
+            pass
+
+        # Dataset must remain intact in store
+        assert "active_ds" in store
+        assert len(store) == 1
+
+    # Once active analysis completes, clear() succeeds
+    store.clear()
+    assert len(store) == 0
+    assert store.total_memory_bytes == 0
+
+
+def test_replacement_failure_preserves_previous_dataset():
+    """Verify attempting to replace an existing dataset with an unfulfillable one preserves the previous dataset."""
+    from backend.store import BoundedDatasetStore, StorageCapacityExhaustedError
+    df_small = pd.DataFrame({"col": range(10)})
+    small_mem = BoundedDatasetStore.estimate_dataframe_memory(df_small)
+
+    store = BoundedDatasetStore(max_datasets=2, max_memory_bytes=small_mem * 2 + 50)
+    store.put("ds_target", df_small, "original.csv")
+    store.put("ds_active", df_small, "active.csv")
+
+    with store.acquire_active("ds_active"):
+        # Attempt to replace ds_target with a payload that cannot fit alongside ds_active
+        df_too_big = pd.DataFrame({"col": range(100)})
+        assert BoundedDatasetStore.estimate_dataframe_memory(df_too_big) + small_mem > store.max_memory_bytes
+
+        try:
+            store.put("ds_target", df_too_big, "replacement.csv")
+            assert False, "Should raise StorageCapacityExhaustedError"
+        except StorageCapacityExhaustedError:
+            pass
+
+        # Previous dataset must remain untouched
+        assert "ds_target" in store
+        assert store["ds_target"].filename == "original.csv"
+        assert len(store) == 2
+
+
+def test_active_operation_refreshes_ttl_on_release():
+    """
+    Verify a long-running active operation refreshes last_accessed on release
+    so the dataset does not immediately expire after completion.
+
+    Timeline (TTL = 100 s):
+      t=1000  put() → last_accessed=1000
+      t=1000  acquire_active() → active_queries=1, last_accessed=1000
+      t=1150  clock advanced inside context (150 s > TTL, but dataset is active)
+      t=1150  finally: active_queries→0, last_accessed refreshed to 1150
+      t=1170  clock +20 → store.get() → last_accessed refreshed to 1170 (TTL restarted)
+      t=1275  clock +105 → 1275-1170=105 > 100 → DatasetSessionExpiredError raised
+    """
+    from backend.store import BoundedDatasetStore, DatasetSessionExpiredError
+    clock = [1000.0]
+    # 100 seconds idle TTL
+    store = BoundedDatasetStore(max_datasets=5, ttl_seconds=100.0, time_provider=lambda: clock[0])
+    df = pd.DataFrame({"col": [1, 2, 3]})
+    store.put("ds_long", df, "long.csv")
+
+    # Begin active query at t=1000.0
+    with store.acquire_active("ds_long"):
+        # Advance clock by 150.0 seconds (to 1150.0), which exceeds TTL but dataset is active
+        clock[0] += 150.0
+
+    # Query finished at t=1150.0; finally block refreshed last_accessed to 1150.0.
+    # Advance clock +20 to 1170.0 — well within the new 100 s TTL window from 1150.0.
+    clock[0] += 20.0
+    assert "ds_long" in store
+    # store.get() also refreshes last_accessed to t=1170.0 and returns the item.
+    item = store.get("ds_long")
+    assert item.filename == "long.csv"
+    assert item.active_queries == 0
+
+    # last_accessed is now 1170.0 (refreshed by store.get() above).
+    # Advance clock by 105 s to t=1275.0 → 1275-1170=105 > TTL(100) → expires.
+    clock[0] += 105.0
+    try:
+        store.get("ds_long")
+        assert False, "Should raise DatasetSessionExpiredError after refreshed TTL expires"
+    except DatasetSessionExpiredError:
+        pass
+
+
+
+def test_concurrent_sample_registration_deduplicated_and_memory_accounted():
+    """Verify concurrent sample registration with deterministic barrier deduplicates atomically with correct memory accounting."""
+    import threading
+    from backend.store import BoundedDatasetStore
+    store = BoundedDatasetStore(max_datasets=5, max_memory_bytes=50 * 1024 * 1024)
+    df = pd.DataFrame({"a": range(100), "b": range(100)})
+    expected_mem = store.estimate_dataframe_memory(df)
+
+    num_threads = 8
+    barrier = threading.Barrier(num_threads)
+    results = []
+    errors = []
+
+    def worker():
+        try:
+            barrier.wait()
+            stored = store.put_or_reuse_sample(df, "sample.csv")
+            results.append(stored.dataset_id)
+        except Exception as e:
+            errors.append(e)
+
+    threads = [threading.Thread(target=worker) for _ in range(num_threads)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert len(errors) == 0
+    assert len(results) == num_threads
+    # All threads received the identical dataset ID
+    assert len(set(results)) == 1
+    # Exactly one sample retained in store
+    assert len(store) == 1
+    # Memory accounted for exactly one dataset, not 8x
+    assert store.total_memory_bytes == expected_mem
