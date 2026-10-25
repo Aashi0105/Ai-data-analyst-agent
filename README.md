@@ -2,6 +2,8 @@
 
 > **Turn raw tabular datasets into actionable business insights, statistics, and visualizations using conversational plain English.**
 
+![App Preview](docs/screenshots/app_preview.png)
+
 ---
 
 ## 📌 Overview
@@ -446,4 +448,4 @@ AI-Data-Analyst-Agent/
 
 ## 📄 License
 
-This project is currently unlicensed. You may add an open-source license (such as [MIT](https://opensource.org/licenses/MIT)) if you intend to distribute or open-source it publicly.
+This project is licensed under the terms of the [MIT License](LICENSE).
