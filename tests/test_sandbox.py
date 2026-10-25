@@ -1100,18 +1100,15 @@ def test_windows_job_object_disabled_fallback(sample_df):
     assert res == 555
 
 
-def test_both_fastapi_and_streamlit_use_shared_executor():
-    """Verify that both FastAPI and Streamlit import and use the exact same shared executor contract."""
+def test_fastapi_uses_shared_executor():
+    """Verify that FastAPI backend imports and uses the exact shared executor contract."""
     import backend.main as backend_main
-    import app as streamlit_app
 
     # Verify identical execution function reference
     assert backend_main.execute_pandas_code is sandbox.execute_pandas_code
-    assert streamlit_app.execute_pandas_code is sandbox.execute_pandas_code
 
     # Verify identical SandboxExecutor class reference
     assert backend_main.SandboxExecutor is sandbox.SandboxExecutor
-    assert streamlit_app.SandboxExecutor is sandbox.SandboxExecutor
 
 
 def test_win32_ctypes_declarations_and_pointer_sizes():

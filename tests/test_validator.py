@@ -395,3 +395,20 @@ def test_blocks_numpy_io_methods(numpy_io_method):
     assert not is_valid
     assert f"forbidden attribute '{numpy_io_method}'" in msg
 
+
+def test_blocks_extreme_exponentiation():
+    """Verify that excessive exponentiation power and base are statically rejected."""
+    # Sane exponentiation is allowed
+    is_valid, _ = validate_code("result = df['revenue'] ** 2")
+    assert is_valid
+
+    # Extreme exponent power (> 1000) is rejected
+    is_valid_pow, msg_pow = validate_code("result = 10 ** 50000")
+    assert not is_valid_pow
+    assert "Exponentiation power exceeds safe limit" in msg_pow
+
+    # Extreme exponent base (> 100,000) is rejected
+    is_valid_base, msg_base = validate_code("result = 1000000 ** 10")
+    assert not is_valid_base
+    assert "Exponentiation base exceeds safe limit" in msg_base
+

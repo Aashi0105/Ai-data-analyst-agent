@@ -10,8 +10,8 @@ This document specifies the dual-layer, cross-platform containment architecture 
 ```mermaid
 flowchart TD
     subgraph ClientLayer [Client & Web Layer]
-        A1[FastAPI REST API /api/analyze]
-        A2[Streamlit Web App app.py]
+        A1[Next.js Web Client: frontend/]
+        A2[FastAPI REST API /api/analyze]
     end
 
     subgraph Admission [Stage 1: Pre-Admission & Static Safety]

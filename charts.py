@@ -29,11 +29,50 @@ def _is_datetime_series(series: pd.Series) -> bool:
     return False
 
 
-def detect_chart_type(result: Any) -> Optional[str]:
+def _is_proportion_or_percentage_series(series: pd.Series) -> bool:
+    """
+    Determines whether a numeric series represents proportions (sum approx 1.0)
+    or percentages (sum approx 100.0) with non-negative, finite values.
+    """
+    if not pd.api.types.is_numeric_dtype(series):
+        return False
+
+    clean_s = pd.to_numeric(series, errors="coerce").dropna()
+    if len(clean_s) < 2:
+        return False
+
+    # Values must be non-negative
+    if (clean_s < 0).any():
+        return False
+
+    total = clean_s.sum()
+    if total <= 0:
+        return False
+
+    # Proportions: sum between 0.95 and 1.05 and no single value exceeds 1.0
+    if 0.95 <= total <= 1.05 and (clean_s <= 1.0).all():
+        return True
+
+    # Percentages: sum between 95.0 and 105.0 and no single value exceeds 100.0
+    if 95.0 <= total <= 105.0 and (clean_s <= 100.0).all():
+        return True
+
+    # Also check if column name explicitly indicates proportion/percentage/share/ratio
+    col_name = str(series.name or "").strip().lower()
+    if col_name in {"proportion", "proportions", "pct", "percent", "percentage", "share", "ratio"}:
+        if (clean_s <= 1.0).all() or (clean_s <= 100.0).all():
+            return True
+
+    return False
+
+
+def detect_chart_type(result: Any, question: Optional[str] = None) -> Optional[str]:
     """
     Analyzes the structure and column dtypes of result to determine the appropriate chart type.
 
     Rules:
+        - Explicit pie chart question + (numeric Series or 2-col Category+Numeric) -> "Pie Chart"
+        - Categorical + Numeric where numeric is proportions or percentages -> "Pie Chart"
         - DataFrame (2 cols: 1 categorical/object, 1 numeric) -> "Bar Chart"
         - DataFrame (2 cols: both numeric) -> "Scatter Plot"
         - DataFrame (2 cols: 1 datetime [or convertible], 1 numeric) -> "Line Chart"
@@ -43,12 +82,21 @@ def detect_chart_type(result: Any) -> Optional[str]:
 
     Args:
         result (Any): Output result object from sandbox execution.
+        question (Optional[str]): Optional user question string to detect explicit chart intent.
 
     Returns:
         Optional[str]: Chart type identifier string or None.
     """
+    is_pie_requested = False
+    if question and isinstance(question, str):
+        q_lower = question.lower()
+        if "pie" in q_lower or "donut" in q_lower or "doughnut" in q_lower:
+            is_pie_requested = True
+
     if isinstance(result, pd.Series):
         if pd.api.types.is_numeric_dtype(result):
+            if is_pie_requested or _is_proportion_or_percentage_series(result):
+                return "Pie Chart"
             return "Bar Chart"
         return None
 
@@ -75,35 +123,38 @@ def detect_chart_type(result: Any) -> Optional[str]:
         is_num1 = pd.api.types.is_numeric_dtype(col1)
         is_num2 = pd.api.types.is_numeric_dtype(col2)
 
-        # Case 3: Datetime column + numeric column -> Line Chart
+        # Datetime column + numeric column -> Line Chart
         if (is_dt1 and is_num2) or (is_dt2 and is_num1):
             return "Line Chart"
 
-        # Case 2: Exactly 2 numeric columns -> Scatter Plot
+        # Exactly 2 numeric columns -> Scatter Plot
         if is_num1 and is_num2:
             return "Scatter Plot"
 
         is_cat1 = pd.api.types.is_object_dtype(col1) or isinstance(col1.dtype, pd.CategoricalDtype) or pd.api.types.is_string_dtype(col1)
         is_cat2 = pd.api.types.is_object_dtype(col2) or isinstance(col2.dtype, pd.CategoricalDtype) or pd.api.types.is_string_dtype(col2)
 
-        # Case 1: First column object/category and second column numeric -> Bar Chart
         if (is_cat1 and is_num2) or (is_cat2 and is_num1):
+            num_col = col2 if is_num2 else col1
+            if is_pie_requested or _is_proportion_or_percentage_series(num_col):
+                return "Pie Chart"
             return "Bar Chart"
 
     return None
 
 
-def generate_chart(result: Any) -> Tuple[Optional[plt.Figure], Optional[str]]:
+def generate_chart(result: Any, question: Optional[str] = None) -> Tuple[Optional[plt.Figure], Optional[str]]:
     """
     Generates a stylized Matplotlib figure based on deterministic chart type detection.
 
     Args:
         result (Any): Output result object from execution sandbox.
+        question (Optional[str]): Optional user query string for intent detection.
 
     Returns:
         Tuple[Optional[plt.Figure], Optional[str]]: (fig, chart_name) or (None, None)
     """
-    chart_type = detect_chart_type(result)
+    chart_type = detect_chart_type(result, question=question)
     if not chart_type:
         return None, None
 
@@ -117,19 +168,37 @@ def generate_chart(result: Any) -> Tuple[Optional[plt.Figure], Optional[str]]:
 
     try:
         if isinstance(result, pd.Series):
-            # Case 5: Series -> Bar Chart
-            x = [str(i) for i in result.index]
-            y = result.values
-            ax.bar(x, y, color=accent_color, alpha=0.85)
-            ax.set_xlabel(str(result.index.name or "Index"))
-            ax.set_ylabel(str(result.name or "Values"))
-            ax.set_title(f"{result.name or 'Series'} Distribution", fontsize=12, fontweight="bold")
-            if len(x) > 5:
-                plt.xticks(rotation=45, ha="right")
+            if chart_type == "Pie Chart":
+                ax.grid(False)
+                clean_s = result.dropna()
+                labels = [str(i) for i in clean_s.index]
+                values = clean_s.values
+                ax.pie(values, labels=labels, autopct="%1.1f%%", startangle=90)
+                ax.set_title(f"{result.name or 'Proportion'} by {result.index.name or 'Category'}", fontsize=12, fontweight="bold")
+            else:
+                # Case 5: Series -> Bar Chart
+                x = [str(i) for i in result.index]
+                y = result.values
+                ax.bar(x, y, color=accent_color, alpha=0.85)
+                ax.set_xlabel(str(result.index.name or "Index"))
+                ax.set_ylabel(str(result.name or "Values"))
+                ax.set_title(f"{result.name or 'Series'} Distribution", fontsize=12, fontweight="bold")
+                if len(x) > 5:
+                    plt.xticks(rotation=45, ha="right")
 
         elif isinstance(result, pd.DataFrame):
             cols = result.columns
-            if chart_type == "Bar Chart":
+            if chart_type == "Pie Chart":
+                ax.grid(False)
+                cat_col = cols[0] if not pd.api.types.is_numeric_dtype(result[cols[0]]) else cols[1]
+                num_col = cols[1] if cat_col == cols[0] else cols[0]
+                clean_df = result.dropna(subset=[cat_col, num_col])
+                labels = [str(val) for val in clean_df[cat_col]]
+                values = clean_df[num_col].values
+                ax.pie(values, labels=labels, autopct="%1.1f%%", startangle=90)
+                ax.set_title(f"{num_col} by {cat_col}", fontsize=12, fontweight="bold")
+
+            elif chart_type == "Bar Chart":
                 cat_col = cols[0] if not pd.api.types.is_numeric_dtype(result[cols[0]]) else cols[1]
                 num_col = cols[1] if cat_col == cols[0] else cols[0]
 

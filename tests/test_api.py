@@ -9,6 +9,7 @@ and schema profiling.
 import io
 import pytest
 from fastapi.testclient import TestClient
+import numpy as np
 import pandas as pd
 
 from backend.main import app, DATASET_STORE
@@ -786,3 +787,99 @@ def test_concurrent_sample_registration_deduplicated_and_memory_accounted():
     assert len(store) == 1
     # Memory accounted for exactly one dataset, not 8x
     assert store.total_memory_bytes == expected_mem
+
+
+def test_recharts_pie_chart_serialization_and_null_handling():
+    """Verify build_recharts_data serializes pie charts with proper formatting and null handling."""
+    from backend.chart_utils import build_recharts_data
+
+    # 1. Proportion DataFrame
+    df_prop = pd.DataFrame({"diagnosis": ["Malignant", "Benign"], "proportion": [0.627, 0.373]})
+    viz = build_recharts_data(df_prop)
+    assert viz is not None
+    assert viz["chart_type"] == "Pie Chart"
+    assert viz["x_key"] == "name"
+    assert viz["y_keys"] == ["value"]
+    assert len(viz["data"]) == 2
+    assert viz["data"][0] == {"name": "Malignant", "value": 0.627}
+    assert viz["data"][1] == {"name": "Benign", "value": 0.373}
+
+    # 2. Percentage Series with question intent
+    s_pct = pd.Series([45.0, 55.0], index=["Product A", "Product B"], name="Share")
+    viz_series = build_recharts_data(s_pct, question="create a pie chart")
+    assert viz_series is not None
+    assert viz_series["chart_type"] == "Pie Chart"
+    assert len(viz_series["data"]) == 2
+    assert viz_series["data"][0]["name"] == "Product A"
+    assert viz_series["data"][0]["value"] == 45.0
+
+    # 3. Non-finite or missing values cleaned safely
+    df_dirty = pd.DataFrame({"Category": ["Alpha", None], "proportion": [0.7, np.nan]})
+    viz_dirty = build_recharts_data(df_dirty, question="pie chart")
+    assert viz_dirty is not None
+    assert viz_dirty["data"][0] == {"name": "Alpha", "value": 0.7}
+    assert viz_dirty["data"][1] == {"name": "Unknown", "value": 0.0}
+
+    # 4. Ordinary comparison defaults to Bar Chart without question
+    df_bar = pd.DataFrame({"Dept": ["HR", "Eng"], "Headcount": [10, 50]})
+    viz_bar = build_recharts_data(df_bar)
+    assert viz_bar["chart_type"] == "Bar Chart"
+
+
+def test_credential_sanitization_comprehensive():
+    """Verify that _sanitize_error_message redacts legacy AIza keys, modern AQ. keys, and bearer tokens."""
+    from backend.main import _sanitize_error_message
+
+    # 1. Legacy AIza Google API key
+    msg1 = "GoogleGenAIError: 400 Invalid key AIzaSyD3x9FakeKey123456789012345678901 in request URL"
+    clean1 = _sanitize_error_message(msg1)
+    assert "AIzaSyD3x9FakeKey123456789012345678901" not in clean1
+    assert "[REDACTED_API_KEY]" in clean1
+
+    # 2. Modern AQ. Google API key
+    msg2 = "ClientError: 403 request failed with token AQ.Ab8RN6I-FakeKey1234567890abcdef at https://api.endpoint"
+    clean2 = _sanitize_error_message(msg2)
+    assert "AQ.Ab8RN6I-FakeKey1234567890abcdef" not in clean2
+    assert "[REDACTED_API_KEY]" in clean2
+
+    # 3. Authorization Bearer token
+    msg3 = "HTTPError: 401 Authorization: Bearer ya29.a0AfH6SMFakeBearerToken9876543210"
+    clean3 = _sanitize_error_message(msg3)
+    assert "ya29.a0AfH6SMFakeBearerToken9876543210" not in clean3
+    assert "Bearer [REDACTED_TOKEN]" in clean3
+
+    # 4. key= query parameter
+    msg4 = "Request failed: https://generativelanguage.googleapis.com/v1beta?key=secret_arbitrary_key_value_12345"
+    clean4 = _sanitize_error_message(msg4)
+    assert "secret_arbitrary_key_value_12345" not in clean4
+    assert "key=[REDACTED]" in clean4
+
+    # 5. Normal error message is preserved
+    normal = "Column 'sales' does not exist in dataset."
+    assert _sanitize_error_message(normal) == normal
+
+
+def test_recharts_infinity_and_truncation_handling():
+    """Verify build_recharts_data cleanly handles positive/negative infinity and marks truncation in titles."""
+    from backend.chart_utils import build_recharts_data
+
+    # 1. Positive and negative infinity in DataFrame values
+    df_inf = pd.DataFrame({
+        "Category": ["PosInf", "NegInf", "Valid"],
+        "Value": [float("inf"), float("-inf"), 42.5]
+    })
+    viz_inf = build_recharts_data(df_inf)
+    assert viz_inf is not None
+    assert viz_inf["data"][0]["value"] == 0.0
+    assert viz_inf["data"][1]["value"] == 0.0
+    assert viz_inf["data"][2]["value"] == 42.5
+
+    # 2. Category truncation (over 30 items) appends '(Top 30)'
+    df_many = pd.DataFrame({
+        "Category": [f"Cat_{i}" for i in range(45)],
+        "Value": [i * 10 for i in range(45)]
+    })
+    viz_many = build_recharts_data(df_many)
+    assert viz_many is not None
+    assert len(viz_many["data"]) == 30
+    assert "(Top 30)" in viz_many["title"]

@@ -13,21 +13,21 @@ import numpy as np
 from charts import detect_chart_type, _is_datetime_series
 
 
-def build_recharts_data(result: Any) -> Optional[Dict[str, Any]]:
+def build_recharts_data(result: Any, question: Optional[str] = None) -> Optional[Dict[str, Any]]:
     """
     Transforms sandbox result into a structured JSON representation
     tailored for Recharts frontend rendering.
 
     Returns:
         Optional[Dict[str, Any]]: {
-            "chart_type": str ("Bar Chart" | "Line Chart" | "Scatter Plot" | "Histogram"),
+            "chart_type": str ("Bar Chart" | "Line Chart" | "Scatter Plot" | "Histogram" | "Pie Chart"),
             "data": List[Dict[str, Any]],
             "x_key": str,
             "y_keys": List[str],
             "title": str
         } or None if not chart-compatible.
     """
-    chart_type = detect_chart_type(result)
+    chart_type = detect_chart_type(result, question=question)
     if not chart_type:
         return None
 
@@ -40,17 +40,38 @@ def build_recharts_data(result: Any) -> Optional[Dict[str, Any]]:
 
             data = []
             for idx, val in s.items():
+                if pd.isna(val) or not np.isfinite(val):
+                    clean_val = 0.0
+                elif isinstance(val, (float, np.floating)):
+                    clean_val = round(float(val), 4 if abs(float(val)) < 1 else 2)
+                else:
+                    clean_val = int(val)
+
                 data.append({
-                    "label": str(idx),
-                    "value": round(float(val), 2) if isinstance(val, (float, np.floating)) else int(val)
+                    "name": str(idx),
+                    "value": clean_val
                 })
 
+            is_truncated = len(data) > 30
+            trunc_suffix = " (Top 30)" if is_truncated else ""
+
+            if chart_type == "Pie Chart":
+                title = f"{s.name or 'Proportion'} by {s.index.name or 'Category'}{trunc_suffix}"
+                return {
+                    "chart_type": "Pie Chart",
+                    "data": data[:30],
+                    "x_key": "name",
+                    "y_keys": ["value"],
+                    "title": title
+                }
+
+            title = f"{s.name or 'Values'} by {s.index.name or 'Category'}{trunc_suffix}"
             return {
                 "chart_type": "Bar Chart",
-                "data": data[:30],  # Keep reasonable ceiling
+                "data": [{"label": d["name"], "value": d["value"]} for d in data[:30]],
                 "x_key": "label",
                 "y_keys": ["value"],
-                "title": f"{s.name or 'Values'} by {s.index.name or 'Category'}"
+                "title": title
             }
 
         # Case 2: DataFrame
@@ -61,25 +82,55 @@ def build_recharts_data(result: Any) -> Optional[Dict[str, Any]]:
 
             cols = list(df.columns)
 
-            if chart_type == "Bar Chart":
+            if chart_type == "Pie Chart":
                 cat_col = cols[0] if not pd.api.types.is_numeric_dtype(df[cols[0]]) else cols[1]
                 num_col = cols[1] if cat_col == cols[0] else cols[0]
 
                 data = []
                 for _, row in df.iterrows():
                     val = row[num_col]
-                    clean_val = round(float(val), 2) if pd.notnull(val) else 0.0
+                    if pd.isna(val) or not np.isfinite(val):
+                        clean_val = 0.0
+                    else:
+                        clean_val = round(float(val), 4 if abs(float(val)) < 1 else 2)
+
+                    cat_val = str(row[cat_col]) if pd.notnull(row[cat_col]) else "Unknown"
+                    data.append({
+                        "name": cat_val,
+                        "value": clean_val
+                    })
+
+                is_truncated = len(data) > 30
+                trunc_suffix = " (Top 30)" if is_truncated else ""
+                return {
+                    "chart_type": "Pie Chart",
+                    "data": data[:30],
+                    "x_key": "name",
+                    "y_keys": ["value"],
+                    "title": f"{num_col} by {cat_col}{trunc_suffix}"
+                }
+
+            elif chart_type == "Bar Chart":
+                cat_col = cols[0] if not pd.api.types.is_numeric_dtype(df[cols[0]]) else cols[1]
+                num_col = cols[1] if cat_col == cols[0] else cols[0]
+
+                data = []
+                for _, row in df.iterrows():
+                    val = row[num_col]
+                    clean_val = round(float(val), 2) if (pd.notnull(val) and np.isfinite(val)) else 0.0
                     data.append({
                         "label": str(row[cat_col]),
                         "value": clean_val
                     })
 
+                is_truncated = len(data) > 30
+                trunc_suffix = " (Top 30)" if is_truncated else ""
                 return {
                     "chart_type": "Bar Chart",
                     "data": data[:30],
                     "x_key": "label",
                     "y_keys": ["value"],
-                    "title": f"{num_col} by {cat_col}"
+                    "title": f"{num_col} by {cat_col}{trunc_suffix}"
                 }
 
             elif chart_type == "Line Chart":
@@ -93,36 +144,44 @@ def build_recharts_data(result: Any) -> Optional[Dict[str, Any]]:
                 data = []
                 for _, row in df_sorted.iterrows():
                     val = row[num_col]
-                    clean_val = round(float(val), 2) if pd.notnull(val) else 0.0
+                    clean_val = round(float(val), 2) if (pd.notnull(val) and np.isfinite(val)) else 0.0
                     dt_str = row[dt_col].strftime("%Y-%m-%d") if hasattr(row[dt_col], "strftime") else str(row[dt_col])
                     data.append({
                         "date": dt_str,
                         "value": clean_val
                     })
 
+                is_truncated = len(data) > 100
+                trunc_suffix = " (First 100)" if is_truncated else ""
                 return {
                     "chart_type": "Line Chart",
                     "data": data[:100],
                     "x_key": "date",
                     "y_keys": ["value"],
-                    "title": f"{num_col} Trend over {dt_col}"
+                    "title": f"{num_col} Trend over {dt_col}{trunc_suffix}"
                 }
 
             elif chart_type == "Scatter Plot":
                 x_col, y_col = cols[0], cols[1]
                 data = []
                 for _, row in df.dropna(subset=[x_col, y_col]).iterrows():
+                    x_val = row[x_col]
+                    y_val = row[y_col]
+                    if not np.isfinite(x_val) or not np.isfinite(y_val):
+                        continue
                     data.append({
-                        "x": round(float(row[x_col]), 2),
-                        "y": round(float(row[y_col]), 2)
+                        "x": round(float(x_val), 2),
+                        "y": round(float(y_val), 2)
                     })
 
+                is_truncated = len(data) > 200
+                trunc_suffix = " (First 200)" if is_truncated else ""
                 return {
                     "chart_type": "Scatter Plot",
                     "data": data[:200],
                     "x_key": "x",
                     "y_keys": ["y"],
-                    "title": f"{y_col} vs {x_col}"
+                    "title": f"{y_col} vs {x_col}{trunc_suffix}"
                 }
 
             elif chart_type == "Histogram":

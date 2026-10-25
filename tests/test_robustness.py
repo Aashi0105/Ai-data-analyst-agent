@@ -114,6 +114,37 @@ def test_chart_detection_robustness():
     df_hist = pd.DataFrame({"Ages": [21, 25, 30, 45, 50]})
     assert detect_chart_type(df_hist) == "Histogram"
 
+    # Pie Chart Case A: Categorical + Proportions (sum ~= 1.0)
+    df_prop = pd.DataFrame({"diagnosis": ["M", "B"], "proportion": [0.63, 0.37]})
+    assert detect_chart_type(df_prop) == "Pie Chart"
+    fig, name = generate_chart(df_prop)
+    assert fig is not None and name == "Pie Chart"
+
+    # Pie Chart Case B: Categorical + Percentages (sum ~= 100.0)
+    df_pct = pd.DataFrame({"Category": ["A", "B", "C"], "pct": [40.0, 35.0, 25.0]})
+    assert detect_chart_type(df_pct) == "Pie Chart"
+    fig, name = generate_chart(df_pct)
+    assert fig is not None and name == "Pie Chart"
+
+    # Pie Chart Case C: Explicit question intent
+    df_custom = pd.DataFrame({"Segment": ["Corp", "Consumer"], "Revenue": [5000, 3000]})
+    # Without question, ordinary comparison is Bar Chart
+    assert detect_chart_type(df_custom) == "Bar Chart"
+    # With explicit pie chart question, detected as Pie Chart
+    assert detect_chart_type(df_custom, question="can you create me a pie chart to analyze my data?") == "Pie Chart"
+    fig, name = generate_chart(df_custom, question="show me a pie chart")
+    assert fig is not None and name == "Pie Chart"
+
+    # Series with explicit pie chart question
+    s_pie = pd.Series([10, 20, 30], index=["A", "B", "C"], name="Counts")
+    assert detect_chart_type(s_pie, question="make a donut chart") == "Pie Chart"
+    fig, name = generate_chart(s_pie, question="make a pie chart")
+    assert fig is not None and name == "Pie Chart"
+
+    # Negative numbers or arbitrary large sums do not accidentally trigger Pie Chart without question
+    df_neg = pd.DataFrame({"Category": ["A", "B"], "Value": [-0.5, 1.5]})
+    assert detect_chart_type(df_neg) == "Bar Chart"
+
 
 def test_dataset_summary_handles_mixed_types():
     """Verify get_dataset_summary correctly handles nulls and calculates statistics."""

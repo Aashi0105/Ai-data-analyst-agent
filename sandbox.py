@@ -1152,7 +1152,7 @@ def _validate_host_output_files(
 class SandboxExecutor:
     """
     Centralized execution orchestration engine for AI-generated pandas code.
-    Shared across FastAPI (backend/main.py) and Streamlit (app.py).
+    Used by the FastAPI backend (backend/main.py) to power the Next.js analysis workspace.
 
     Enforces:
       - Admission constraints (code size, row/column counts, memory admission).
@@ -1677,7 +1677,7 @@ def execute_pandas_code(
 ) -> Tuple[bool, Any]:
     """
     Executes validated pandas code in an isolated subprocess worker with strict resource budgeting.
-    Delegates to the unified SandboxExecutor singleton shared across FastAPI and Streamlit.
+    Delegates to the unified SandboxExecutor singleton.
 
     Args:
         code_str (str): AST-validated Python pandas code.

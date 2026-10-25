@@ -190,6 +190,15 @@ def validate_code(code_str: str) -> Tuple[bool, str]:
             if node.attr in FORBIDDEN_NAMES:
                 return False, f"Access to forbidden attribute '{node.attr}' is not allowed."
 
+        # Guard against static resource exhaustion via extreme constant exponentiation
+        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Pow):
+            if isinstance(node.right, ast.Constant) and isinstance(node.right.value, (int, float)):
+                if abs(node.right.value) > 1000:
+                    return False, "Exponentiation power exceeds safe limit (max 1000)."
+            if isinstance(node.left, ast.Constant) and isinstance(node.left.value, (int, float)):
+                if abs(node.left.value) > 100_000:
+                    return False, "Exponentiation base exceeds safe limit (max 100,000)."
+
         # Track assignments to 'result'
         if isinstance(node, ast.Assign):
             for target in node.targets:

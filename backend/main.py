@@ -151,13 +151,20 @@ class AnalyzeResponse(BaseModel):
 
 # ============================================================================
 def _sanitize_error_message(msg: str) -> str:
-    """Removes potential API keys, query params, and raw traceback dumps from error text."""
+    """Removes potential API keys, query params, auth tokens, and raw traceback dumps from error text."""
     if not msg:
         return "An internal error occurred."
-    # Remove Google API keys (AIza...)
-    cleaned = re.sub(r"AIza[0-9A-Za-z_-]{35}", "[REDACTED_API_KEY]", str(msg))
-    # Remove key query parameters
-    cleaned = re.sub(r"key=[0-9A-Za-z_-]+", "key=[REDACTED]", cleaned)
+
+    text = str(msg)
+    # Remove legacy Google API keys (AIza...)
+    cleaned = re.sub(r"AIza[0-9A-Za-z_-]{30,}", "[REDACTED_API_KEY]", text)
+    # Remove modern Google API keys (AQ.<base64/hex token>)
+    cleaned = re.sub(r"AQ\.[0-9A-Za-z_-]{20,}", "[REDACTED_API_KEY]", cleaned)
+    # Remove Authorization Bearer credentials
+    cleaned = re.sub(r"(?i)\bbearer\s+[A-Za-z0-9._~+/-]{16,}\b", "Bearer [REDACTED_TOKEN]", cleaned)
+    # Remove x-goog-api-key headers and key= query parameters
+    cleaned = re.sub(r"(?i)(?:key|api[_-]?key|token)\s*[=:]\s*['\"]?[0-9A-Za-z._~+/-]{10,}['\"]?", "key=[REDACTED]", cleaned)
+
     # Truncate internal stack traces to first meaningful line
     first_line = cleaned.strip().split("\n")[0]
     return first_line[:200]
@@ -438,7 +445,7 @@ def analyze_data(request: AnalyzeRequest) -> AnalyzeResponse:
                     rows=clean_df.to_dict(orient="records")
                 )
                 # Attempt to build structured chart data
-                recharts_obj = build_recharts_data(res)
+                recharts_obj = build_recharts_data(res, question=user_question)
                 if recharts_obj:
                     viz_data = VisualizationData(**recharts_obj)
 
@@ -453,7 +460,7 @@ def analyze_data(request: AnalyzeRequest) -> AnalyzeResponse:
                     rows.append({index_col: str(idx), val_col: clean_val})
                 table_data = TableData(columns=[index_col, val_col], rows=rows)
 
-                recharts_obj = build_recharts_data(res)
+                recharts_obj = build_recharts_data(res, question=user_question)
                 if recharts_obj:
                     viz_data = VisualizationData(**recharts_obj)
 
