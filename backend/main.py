@@ -27,6 +27,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 from utils import load_csv, get_dataset_summary, format_value
+from profiler import DatasetProfile, profile_dataset
+from understanding import DatasetUnderstanding, generate_dataset_understanding, generate_deterministic_fallback
 from agent import DataAnalystAgent
 from validator import clean_code, validate_code
 from sandbox import execute_pandas_code, SandboxExecutor
@@ -109,6 +111,8 @@ class DatasetMetadataResponse(BaseModel):
     dtypes: Dict[str, str]
     schema_info: List[ColumnSchema] = Field(..., serialization_alias="schema")
     preview: List[Dict[str, Any]]
+    profile: Optional[DatasetProfile] = None
+    understanding: Optional[DatasetUnderstanding] = None
 
 
 class DeleteDatasetResponse(BaseModel):
@@ -170,8 +174,14 @@ def _sanitize_error_message(msg: str) -> str:
     return first_line[:200]
 
 
-def _format_dataset_response(dataset_id: str, filename: str, df: pd.DataFrame) -> DatasetMetadataResponse:
-    """Extracts summary and formats Pydantic response."""
+def _format_dataset_response(
+    dataset_id: str,
+    filename: str,
+    df: pd.DataFrame,
+    profile: Optional[DatasetProfile] = None,
+    understanding: Optional[DatasetUnderstanding] = None
+) -> DatasetMetadataResponse:
+    """Extracts summary, computes profile/understanding if absent, and formats Pydantic response."""
     summary = get_dataset_summary(df)
 
     schema_list = []
@@ -187,6 +197,11 @@ def _format_dataset_response(dataset_id: str, filename: str, df: pd.DataFrame) -
     preview_df = df.head(10).replace({np.nan: None})
     preview_records = preview_df.to_dict(orient="records")
 
+    if profile is None:
+        profile = profile_dataset(df)
+    if understanding is None:
+        understanding = generate_dataset_understanding(df, profile)
+
     return DatasetMetadataResponse(
         dataset_id=dataset_id,
         filename=filename,
@@ -197,7 +212,9 @@ def _format_dataset_response(dataset_id: str, filename: str, df: pd.DataFrame) -
         columns=[str(c) for c in df.columns],
         dtypes={str(k): str(v) for k, v in summary["dtypes"].items()},
         schema_info=schema_list,
-        preview=preview_records
+        preview=preview_records,
+        profile=profile,
+        understanding=understanding,
     )
 
 
@@ -219,7 +236,7 @@ def health_check() -> Dict[str, Any]:
 async def upload_dataset(request: Request, file: UploadFile = File(...)) -> DatasetMetadataResponse:
     """
     Ingests a user-uploaded CSV file, profiles the schema,
-    and stores the DataFrame in in-memory session storage.
+    generates grounded dataset understanding, and stores the DataFrame.
     Enforces a strict maximum file size of 25 MiB via bounded chunk reading.
     """
     if not file.filename or not file.filename.lower().endswith(".csv"):
@@ -265,14 +282,29 @@ async def upload_dataset(request: Request, file: UploadFile = File(...)) -> Data
 
     dataset_id = str(uuid.uuid4())
     try:
-        DATASET_STORE.put(dataset_id, df, file.filename)
+        # Enforce store capacity and reservation first before profiling or calling LLM
+        stored = DATASET_STORE.put(dataset_id, df, file.filename)
     except StorageCapacityExhaustedError as e:
         raise HTTPException(
             status_code=503,
             detail=f"Storage capacity temporarily exhausted: {str(e)}"
         )
 
-    return _format_dataset_response(dataset_id, file.filename, df)
+    try:
+        # Profile dataset and generate grounded understanding (with instant fallback)
+        profile = profile_dataset(df)
+        understanding = generate_dataset_understanding(df, profile)
+        stored.profile = profile
+        stored.understanding = understanding
+    except Exception as e:
+        # Rollback: avoid retaining orphaned dataset in store if profiling throws an unhandled error
+        try:
+            DATASET_STORE.delete(dataset_id)
+        except Exception:
+            pass
+        raise HTTPException(status_code=500, detail=f"Failed to profile dataset: {str(e)}")
+
+    return _format_dataset_response(dataset_id, file.filename, df, profile=profile, understanding=understanding)
 
 
 @app.post("/api/datasets/sample", response_model=DatasetMetadataResponse)
@@ -286,7 +318,14 @@ def load_sample_dataset() -> DatasetMetadataResponse:
     # Fast-path check for existing unexpired sample without disk I/O
     existing = DATASET_STORE.get_sample()
     if existing is not None:
-        return _format_dataset_response(existing.dataset_id, existing.filename, existing.df)
+        if not existing.profile:
+            existing.profile = profile_dataset(existing.df)
+        if not existing.understanding:
+            existing.understanding = generate_dataset_understanding(existing.df, existing.profile)
+        return _format_dataset_response(
+            existing.dataset_id, existing.filename, existing.df,
+            profile=existing.profile, understanding=existing.understanding
+        )
 
     sample_path = os.path.join(WORKSPACE_ROOT, "data", "ecommerce_sales.csv")
     if not os.path.exists(sample_path):
@@ -301,21 +340,51 @@ def load_sample_dataset() -> DatasetMetadataResponse:
     filename = "ecommerce_sales.csv (Sample)"
     try:
         stored = DATASET_STORE.put_or_reuse_sample(df, filename)
+        if not stored.profile:
+            stored.profile = profile_dataset(stored.df)
+        if not stored.understanding:
+            stored.understanding = generate_dataset_understanding(stored.df, stored.profile)
     except StorageCapacityExhaustedError as e:
         raise HTTPException(
             status_code=503,
             detail=f"Storage capacity temporarily exhausted: {str(e)}"
         )
 
-    return _format_dataset_response(stored.dataset_id, stored.filename, stored.df)
+    return _format_dataset_response(
+        stored.dataset_id, stored.filename, stored.df,
+        profile=stored.profile, understanding=stored.understanding
+    )
 
 
 @app.get("/api/datasets/{dataset_id}", response_model=DatasetMetadataResponse)
 def get_dataset(dataset_id: str) -> DatasetMetadataResponse:
-    """Retrieves dataset summary and schema for an active session."""
+    """Retrieves dataset summary, schema, profile, and understanding for an active session."""
     try:
         stored = DATASET_STORE.get(dataset_id)
-        return _format_dataset_response(dataset_id, stored.filename, stored.df)
+        if not stored.profile:
+            stored.profile = profile_dataset(stored.df)
+        if not stored.understanding:
+            stored.understanding = generate_dataset_understanding(stored.df, stored.profile)
+        return _format_dataset_response(
+            dataset_id, stored.filename, stored.df,
+            profile=stored.profile, understanding=stored.understanding
+        )
+    except DatasetSessionExpiredError:
+        raise HTTPException(status_code=404, detail="Dataset session expired. Please re-upload your CSV.")
+    except DatasetNotFoundError:
+        raise HTTPException(status_code=404, detail=f"Dataset with ID '{dataset_id}' was not found in server memory.")
+
+
+@app.get("/api/datasets/{dataset_id}/understanding", response_model=DatasetUnderstanding)
+def get_dataset_understanding_endpoint(dataset_id: str) -> DatasetUnderstanding:
+    """Retrieves or generates dataset understanding and 5 suggested questions."""
+    try:
+        stored = DATASET_STORE.get(dataset_id)
+        if not stored.profile:
+            stored.profile = profile_dataset(stored.df)
+        if not stored.understanding:
+            stored.understanding = generate_dataset_understanding(stored.df, stored.profile)
+        return stored.understanding
     except DatasetSessionExpiredError:
         raise HTTPException(status_code=404, detail="Dataset session expired. Please re-upload your CSV.")
     except DatasetNotFoundError:

@@ -1,7 +1,7 @@
 "use client";
 
 import React, { useState } from "react";
-import { X, Table, FileSpreadsheet, Layers } from "lucide-react";
+import { X, Table, FileSpreadsheet, Layers, BarChart2 } from "lucide-react";
 import { DatasetMetadata } from "@/types";
 
 interface DatasetInspectorProps {
@@ -15,9 +15,12 @@ export const DatasetInspector: React.FC<DatasetInspectorProps> = ({
   isOpen,
   onClose,
 }) => {
-  const [activeTab, setActiveTab] = useState<"preview" | "schema">("preview");
+  const [activeTab, setActiveTab] = useState<"preview" | "schema" | "stats">("preview");
 
   if (!isOpen) return null;
+
+  const profile = dataset.profile;
+  const colProfiles = profile?.column_profiles || {};
 
   return (
     <div className="fixed inset-0 z-50 bg-charcoal/40 backdrop-blur-sm flex items-center justify-center p-4 sm:p-6">
@@ -62,6 +65,17 @@ export const DatasetInspector: React.FC<DatasetInspectorProps> = ({
           >
             <Layers className="w-4 h-4" />
             <span>Column Schema & Nulls ({dataset.columns.length})</span>
+          </button>
+          <button
+            onClick={() => setActiveTab("stats")}
+            className={`py-3 font-medium border-b-2 transition flex items-center space-x-1.5 ${
+              activeTab === "stats"
+                ? "border-editorial-accent text-editorial-accent"
+                : "border-transparent text-charcoal-muted hover:text-charcoal"
+            }`}
+          >
+            <BarChart2 className="w-4 h-4" />
+            <span>Descriptive Statistics</span>
           </button>
         </div>
 
@@ -120,6 +134,84 @@ export const DatasetInspector: React.FC<DatasetInspectorProps> = ({
                   ))}
                 </tbody>
               </table>
+            </div>
+          )}
+
+          {activeTab === "stats" && (
+            <div className="space-y-4">
+              <div className="overflow-x-auto border border-editorial-border rounded">
+                <table className="w-full text-xs text-left">
+                  <thead className="bg-cream border-b border-editorial-border text-charcoal font-semibold">
+                    <tr>
+                      <th className="py-2.5 px-4">Column</th>
+                      <th className="py-2.5 px-3">Type</th>
+                      <th className="py-2.5 px-4">Summary Statistics / Distributions</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-editorial-border/60 text-charcoal">
+                    {dataset.columns.map((col, idx) => {
+                      const p = colProfiles[col];
+                      return (
+                        <tr key={idx} className="hover:bg-stone-50/70">
+                          <td className="py-3 px-4 font-mono font-medium align-top whitespace-nowrap">
+                            {col}
+                          </td>
+                          <td className="py-3 px-3 align-top whitespace-nowrap">
+                            <span className="text-[10px] uppercase font-mono px-1.5 py-0.5 rounded bg-cream border border-editorial-border">
+                              {p?.semantic_type || "column"}
+                            </span>
+                          </td>
+                          <td className="py-3 px-4 text-charcoal-muted text-[11px] align-top">
+                            {p?.semantic_type === "numeric" && p.numeric_stats && (
+                              <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 font-mono">
+                                <div><span className="text-charcoal-subtle">Min:</span> {p.numeric_stats.min ?? "-"}</div>
+                                <div><span className="text-charcoal-subtle">Max:</span> {p.numeric_stats.max ?? "-"}</div>
+                                <div><span className="text-charcoal-subtle">Mean:</span> {p.numeric_stats.mean ?? "-"}</div>
+                                <div><span className="text-charcoal-subtle">Median:</span> {p.numeric_stats.median ?? "-"}</div>
+                                <div><span className="text-charcoal-subtle">Std:</span> {p.numeric_stats.std ?? "-"}</div>
+                                <div><span className="text-charcoal-subtle">Q25:</span> {p.numeric_stats.q25 ?? "-"}</div>
+                                <div><span className="text-charcoal-subtle">Q75:</span> {p.numeric_stats.q75 ?? "-"}</div>
+                              </div>
+                            )}
+
+                            {p?.semantic_type in { categorical: 1, boolean: 1, text: 1 } && p?.categorical_stats && (
+                              <div>
+                                <div className="mb-1">
+                                  <span className="text-charcoal-subtle">Unique categories:</span>{" "}
+                                  <span className="font-mono font-medium text-charcoal">{p.categorical_stats.unique_count}</span>
+                                </div>
+                                {p.categorical_stats.top_categories.length > 0 && (
+                                  <div className="flex flex-wrap gap-1.5 mt-1">
+                                    {p.categorical_stats.top_categories.map((c, cIdx) => (
+                                      <span
+                                        key={cIdx}
+                                        className="inline-block px-1.5 py-0.5 rounded bg-stone-100 border border-stone-200 text-[10px]"
+                                      >
+                                        <span className="font-medium text-charcoal">{c.value}</span>: {c.count} ({c.pct}%)
+                                      </span>
+                                    ))}
+                                  </div>
+                                )}
+                              </div>
+                            )}
+
+                            {p?.semantic_type === "datetime" && p.date_stats && (
+                              <div className="font-mono">
+                                <div><span className="text-charcoal-subtle">Earliest:</span> {p.date_stats.min_date ?? "-"}</div>
+                                <div><span className="text-charcoal-subtle">Latest:</span> {p.date_stats.max_date ?? "-"}</div>
+                              </div>
+                            )}
+
+                            {(!p || p.semantic_type === "empty") && (
+                              <span className="italic text-charcoal-subtle">Empty or unprofiled column</span>
+                            )}
+                          </td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
             </div>
           )}
         </div>

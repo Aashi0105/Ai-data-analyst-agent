@@ -48,11 +48,27 @@ export const DatasetSidebar: React.FC<DatasetSidebarProps> = ({
         </div>
         <div className="p-2.5 rounded border border-editorial-border bg-surface">
           <span className="text-[11px] text-charcoal-muted block">Duplicates</span>
-          <span className="text-base font-semibold text-charcoal">
+          <span className={`text-base font-semibold ${dataset.duplicate_rows > 0 ? "text-amber-700" : "text-charcoal"}`}>
             {dataset.duplicate_rows}
           </span>
         </div>
       </div>
+
+      {/* Quality Warnings Banner (if any) */}
+      {dataset.profile?.warnings && dataset.profile.warnings.length > 0 && (
+        <div className="p-2.5 rounded border border-amber-200 bg-amber-50/80 text-[11px] text-amber-900 flex items-center justify-between">
+          <span className="flex items-center space-x-1.5 font-medium">
+            <AlertTriangle className="w-3.5 h-3.5 text-amber-700 shrink-0" />
+            <span>{dataset.profile.warnings.length} Quality Notice{dataset.profile.warnings.length > 1 ? "s" : ""}</span>
+          </span>
+          <button
+            onClick={onOpenInspector}
+            className="text-[10px] text-amber-800 underline font-semibold hover:text-amber-950"
+          >
+            Review
+          </button>
+        </div>
+      )}
 
       {/* Columns List with Types */}
       <div className="flex-1 flex flex-col min-h-0">
@@ -69,19 +85,26 @@ export const DatasetSidebar: React.FC<DatasetSidebarProps> = ({
         </div>
 
         <div className="space-y-1.5 overflow-y-auto pr-1 flex-1 max-h-[420px]">
-          {dataset.schema.map((item, idx) => (
-            <div
-              key={idx}
-              className="flex items-center justify-between text-xs py-1.5 px-2 rounded border border-editorial-border/60 bg-surface/70 hover:bg-surface transition"
-            >
-              <span className="font-mono text-[11px] text-charcoal truncate max-w-[130px]" title={item.column}>
-                {item.column}
-              </span>
-              <span className="text-[10px] text-charcoal-subtle px-1.5 py-0.5 rounded bg-cream border border-editorial-border/70 font-mono">
-                {item.type.replace("int64", "int").replace("float64", "float").replace("object", "str")}
-              </span>
-            </div>
-          ))}
+          {dataset.schema.map((item, idx) => {
+            const semType = dataset.profile?.column_profiles?.[item.column]?.semantic_type;
+            const typeLabel = semType
+              ? semType.slice(0, 4)
+              : item.type.replace("int64", "int").replace("float64", "float").replace("object", "str");
+
+            return (
+              <div
+                key={idx}
+                className="flex items-center justify-between text-xs py-1.5 px-2 rounded border border-editorial-border/60 bg-surface/70 hover:bg-surface transition"
+              >
+                <span className="font-mono text-[11px] text-charcoal truncate max-w-[130px]" title={item.column}>
+                  {item.column}
+                </span>
+                <span className="text-[10px] text-charcoal-subtle px-1.5 py-0.5 rounded bg-cream border border-editorial-border/70 font-mono uppercase">
+                  {typeLabel}
+                </span>
+              </div>
+            );
+          })}
         </div>
       </div>
     </aside>

@@ -77,6 +77,8 @@ class StoredDataset:
     memory_bytes: int
     active_queries: int = 0
     is_sample: bool = False
+    profile: Optional[Any] = None
+    understanding: Optional[Any] = None
 
     def __getitem__(self, key: str) -> Any:
         """Emulate legacy dictionary access for backwards compatibility."""
@@ -96,10 +98,14 @@ class StoredDataset:
             return self.last_accessed
         elif key == "is_sample":
             return self.is_sample
+        elif key == "profile":
+            return self.profile
+        elif key == "understanding":
+            return self.understanding
         raise KeyError(f"StoredDataset has no key '{key}'")
 
     def __contains__(self, key: str) -> bool:
-        return key in ("df", "filename", "uploaded_at", "dataset_id", "memory_bytes", "active_queries", "last_accessed", "is_sample")
+        return key in ("df", "filename", "uploaded_at", "dataset_id", "memory_bytes", "active_queries", "last_accessed", "is_sample", "profile", "understanding")
 
     def get(self, key: str, default: Any = None) -> Any:
         try:
@@ -108,7 +114,7 @@ class StoredDataset:
             return default
 
     def keys(self) -> List[str]:
-        return ["df", "filename", "uploaded_at", "dataset_id", "memory_bytes", "active_queries", "last_accessed", "is_sample"]
+        return ["df", "filename", "uploaded_at", "dataset_id", "memory_bytes", "active_queries", "last_accessed", "is_sample", "profile", "understanding"]
 
     def values(self) -> List[Any]:
         return [self[k] for k in self.keys()]

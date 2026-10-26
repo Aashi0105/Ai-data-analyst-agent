@@ -6,6 +6,7 @@ import { analyzeQuery } from "@/lib/api";
 import { ResultVisualization } from "./ResultVisualization";
 import { CodeAuditPanel } from "./CodeAuditPanel";
 import { QueryHistory } from "./QueryHistory";
+import { DatasetUnderstandingCard } from "./DatasetUnderstandingCard";
 import { Send, Sparkles, AlertCircle, Loader2, Table2 } from "lucide-react";
 
 interface AnalysisWorkspaceProps {
@@ -68,6 +69,12 @@ export const AnalysisWorkspace: React.FC<AnalysisWorkspaceProps> = ({ dataset })
     setErrorMessage(item.response.error_message || null);
   };
 
+  const quickSuggestions = dataset.understanding?.suggested_questions || [
+    "Which region generated the most revenue?",
+    "What are the top 5 products by revenue?",
+    "What is the average customer rating?",
+  ];
+
   return (
     <div className="flex-1 flex flex-col p-6 sm:p-10 max-w-5xl mx-auto w-full overflow-y-auto">
       {/* Header */}
@@ -79,6 +86,18 @@ export const AnalysisWorkspace: React.FC<AnalysisWorkspaceProps> = ({ dataset })
           Explore {dataset.filename.replace(" (Sample)", "")}
         </h1>
       </div>
+
+      {/* Dataset Understanding Card */}
+      {dataset.understanding && (
+        <DatasetUnderstandingCard
+          dataset={dataset}
+          onSelectQuestion={(q) => {
+            setQuestion(q);
+            handleAnalyze(q);
+          }}
+          isLoading={isLoading}
+        />
+      )}
 
       {/* Query Input Card */}
       <div className="border border-editorial-border rounded-lg bg-surface p-4 shadow-sm">
@@ -125,11 +144,7 @@ export const AnalysisWorkspace: React.FC<AnalysisWorkspaceProps> = ({ dataset })
             <Sparkles className="w-3 h-3 text-editorial-accent" />
             <span>Suggestions:</span>
           </span>
-          {[
-            "Which region generated the most revenue?",
-            "What are the top 5 products by revenue?",
-            "What is the average customer rating?",
-          ].map((prompt, idx) => (
+          {quickSuggestions.slice(0, 3).map((prompt, idx) => (
             <button
               key={idx}
               type="button"

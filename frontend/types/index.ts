@@ -5,6 +5,85 @@ export interface ColumnSchema {
   missing_pct: number;
 }
 
+export interface NumericColumnStats {
+  count: number;
+  missing_count: number;
+  missing_pct: number;
+  min?: number | null;
+  max?: number | null;
+  mean?: number | null;
+  median?: number | null;
+  std?: number | null;
+  q25?: number | null;
+  q75?: number | null;
+}
+
+export interface CategoryFrequency {
+  value: string;
+  count: number;
+  pct: number;
+}
+
+export interface CategoricalColumnStats {
+  count: number;
+  missing_count: number;
+  missing_pct: number;
+  unique_count: number;
+  top_categories: CategoryFrequency[];
+}
+
+export interface DateColumnStats {
+  count: number;
+  missing_count: number;
+  missing_pct: number;
+  min_date?: string | null;
+  max_date?: string | null;
+}
+
+export interface ColumnProfile {
+  name: string;
+  dtype: string;
+  semantic_type: "numeric" | "categorical" | "datetime" | "boolean" | "text" | "empty";
+  missing_count: number;
+  missing_pct: number;
+  numeric_stats?: NumericColumnStats | null;
+  categorical_stats?: CategoricalColumnStats | null;
+  date_stats?: DateColumnStats | null;
+}
+
+export interface DataQualityWarning {
+  code: string;
+  column?: string | null;
+  message: string;
+  severity: "info" | "warning" | "critical";
+}
+
+export interface DatasetProfile {
+  num_rows: number;
+  num_cols: number;
+  total_missing: number;
+  missing_cell_pct: number;
+  duplicate_rows: number;
+  duplicate_row_pct: number;
+  columns: string[];
+  column_profiles: Record<string, ColumnProfile>;
+  warnings: DataQualityWarning[];
+}
+
+export interface ColumnInsight {
+  column: string;
+  inferred_meaning: string;
+}
+
+export interface DatasetUnderstanding {
+  overview: string;
+  column_insights: ColumnInsight[];
+  analytical_potential: string;
+  data_quality_notes: string;
+  suggested_questions: string[];
+  status: "generated" | "fallback";
+}
+
 export interface DatasetMetadata {
   dataset_id: string;
   filename: string;
@@ -16,6 +95,8 @@ export interface DatasetMetadata {
   dtypes: Record<string, string>;
   schema: ColumnSchema[];
   preview: Record<string, any>[];
+  profile?: DatasetProfile;
+  understanding?: DatasetUnderstanding;
 }
 
 export interface TableData {
