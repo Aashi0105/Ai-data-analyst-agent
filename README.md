@@ -303,27 +303,36 @@ The FastAPI backend exposes strongly typed endpoints for dataset session lifecyc
 
 ## 💾 Dataset Storage Limits, TTL & Eviction
 
-The backend manages dataset state through `BoundedDatasetStore` (`backend/store.py`), preventing memory exhaustion Denial-of-Service (DoS):
+The backend manages dataset state through `BoundedDatasetStore` (`backend/store.py`), preventing memory exhaustion Denial-of-Service (DoS) and invalidation of in-flight analysis queries:
 
 | Parameter | Default Value | Environment Variable | Description |
 |---|---|---|---|
 | **Max Datasets** | `15` | `DATASET_STORE_MAX_DATASETS` | Maximum number of concurrent datasets retained in memory. |
 | **Max Aggregate RAM** | `512 MiB` | `DATASET_STORE_MAX_MEMORY_MB` | Cumulative DataFrame memory ceiling calculated via `df.memory_usage(deep=True)`. |
 | **Idle TTL** | `3600.0 s` (1 hour) | `DATASET_STORE_TTL_SECONDS` | Expired datasets are lazily purged on subsequent access or capacity checks. |
-| **Max Upload Size** | `25 MiB` | Constant (`MAX_UPLOAD_SIZE_MB`) | Strict streaming chunk limit for single file uploads. |
+| **Max Upload Size** | `25 MiB` | Constant (`MAX_UPLOAD_SIZE_MB`) | Strict streaming chunk limit (1 MiB chunks) for single file uploads. |
 
-### Lifecycle & Eviction Guarantees:
-- **Active Query Immunity:** A dataset currently undergoing Gemini code generation or sandbox execution has `active_queries > 0`. It is immune from LRU eviction and manual deletion (`409 Conflict`).
-- **LRU Eviction:** When capacity is needed, inactive unexpired datasets are evicted in Least-Recently-Used order.
-- **Atomic All-or-Nothing Insertion:** If an incoming dataset cannot fit even after evicting all eligible inactive datasets, the store rejects the insertion with `503 Service Unavailable` without evicting or altering existing entries.
-- **TTL Refresh:** Dataset `last_accessed` timestamp refreshes on query start and release.
+### 🔄 Comprehensive Dataset Lifecycle Table
+
+The following table documents the exact verified behavior implemented across all stages of dataset lifetime:
+
+| Lifecycle Stage / Control | Implementation Mechanism | Configured Bounds & Defaults | Verified Behavior & Error Handling |
+| :--- | :--- | :--- | :--- |
+| **Ingestion & Upload** | Streaming chunk validation (`backend/main.py`) | Max 25 MiB (`MAX_UPLOAD_SIZE_MB`), 1 MiB chunk reading | Reads file in 1 MiB chunks. Rejects files $> 25\text{ MiB}$ immediately with HTTP `413 Payload Too Large`. Verifies CSV structure with encoding fallback (UTF-8, Latin-1, CP1252). |
+| **Memory Accounting** | Deep buffer estimation (`BoundedDatasetStore.estimate_dataframe_memory`) | Max 512 MiB (`DATASET_STORE_MAX_MEMORY_MB`) aggregate store budget | Measures actual buffer allocations using `df.memory_usage(deep=True).sum()`. Represents an internal buffer estimate, not a hard OS process ceiling. If a single incoming dataset exceeds 512 MiB, it is rejected immediately with HTTP `503 Service Unavailable` without evicting existing datasets. |
+| **Dataset Expiration / Idle TTL** | Lazy expiration on lookup and capacity check (`_is_expired`) | 3,600.0 s / 1 hour (`DATASET_STORE_TTL_SECONDS`) | Checked on `get()`, `acquire_active()`, `delete()`, `put()`, `get_sample()`, and `len()`. If `(now - last_accessed) > ttl_seconds` and `active_queries == 0`, dataset is purged from memory. Subsequent lookups raise `DatasetSessionExpiredError` $\rightarrow$ HTTP `404 Not Found` (`"Dataset session expired. Please re-upload your CSV."`). |
+| **Active Query Reference Tracking** | Exception-safe context manager (`acquire_active`) | Reference counter (`StoredDataset.active_queries`) | Incremented at the start of `/api/analyze` and decremented in `finally:`. Releases store lock while yielding DataFrame so concurrent queries do not block. While `active_queries > 0`, the dataset is **immune from LRU eviction, immune from TTL purge, and protected against manual deletion**. |
+| **LRU Eviction Policy** | Atomic multi-candidate eviction (`_put_locked`) | Triggered when count $> 15$ or RAM $> 512\text{ MiB}$ | When capacity is needed, inactive expired entries are purged first. If more space is required, inactive unexpired entries (`active_queries == 0`) are evicted in Least-Recently-Used order based on `OrderedDict` access order. |
+| **Storage Capacity Exhaustion** | Atomic all-or-nothing insertion simulation | Dynamic based on active analyses vs. inactive candidates | If required capacity cannot be obtained because all existing candidates are actively undergoing analysis (`active_queries > 0`), the store raises `StorageCapacityExhaustedError` $\rightarrow$ HTTP `503 Service Unavailable`. **Strict All-or-Nothing Guarantee:** Existing datasets are never evicted or mutated if the new dataset cannot be accommodated. |
+| **Manual Session Cleanup** | Explicit deletion endpoint (`DELETE /api/datasets/{dataset_id}`) | Single dataset ID | Removes dataset from store and immediately decrements `_total_memory_bytes`, releasing references to Python's garbage collector. If the dataset is actively undergoing analysis (`active_queries > 0`), rejects deletion with HTTP `409 Conflict`. If not found or expired, returns HTTP `404 Not Found`. |
+| **Sample Dataset Deduplication** | Atomic reuse (`put_or_reuse_sample`, `get_sample`) | Benchmark sample `data/ecommerce_sales.csv` | Reuses an existing unexpired sample dataset (`is_sample=True`) to prevent repeated demo clicks from allocating duplicate DataFrames. Estimates deep memory outside write lock to prevent contention. |
 
 ---
 
 ## 🧪 Running Tests & Validation
 
-The test suite consists of **two distinct validation workflows** (256 total collected items):
-- **General Test Suite (Windows & Linux CI):** 253 tests covering unit, AST validation, Windows Job Object containment, error recovery, API lifecycle, Recharts chart serialization, credential redaction, and PII masking. Docker tests are deselected (`-k "not test_docker_real_container"`).
+The test suite consists of **two distinct validation workflows** (325 total collected items):
+- **General Test Suite (Windows & Linux CI):** 322 tests covering unit, safe adversarial validation, AST security rules, Windows Job Object containment, error recovery, API lifecycle, Recharts chart serialization, credential redaction, and PII masking. Docker tests are deselected (`-k "not test_docker_real_container"`).
 - **Docker Containment Workflow (Native Linux CI Only):** 3 real integration tests exercising `--network none`, `--read-only` rootfs, and container lifecycle boundaries on an Ubuntu runner with Docker daemon.
 
 ### 1. General Test Suite (Windows & Linux CI)
@@ -331,7 +340,7 @@ Run the full non-Docker test suite:
 ```bash
 pytest tests/ -k "not test_docker_real_container" -v --tb=short
 ```
-*Current verified result:* **253 passed, 3 deselected, 14 warnings** (executed offline without external network or API keys).
+*Current verified result:* **322 passed, 3 deselected, 14 warnings** (executed offline without external network or API keys).
 
 ### 2. Real Linux Docker Containment Tests (Linux Only)
 The 3 real Docker containment tests require a native Linux host with the Docker daemon running and the sandbox image built:
