@@ -401,7 +401,8 @@ class TestApiIntegrationAndCompatibility(unittest.TestCase):
         })
         profile = profile_dataset(df)
 
-        resp = _format_dataset_response("test-id-1", "test.csv", df, profile=profile)
+        with patch("overview.os.getenv", return_value=None):
+            resp = _format_dataset_response("test-id-1", "test.csv", df, profile=profile)
         self.assertIsNotNone(resp.overview)
         self.assertEqual(resp.overview.status, "deterministic")
         json_data = resp.model_dump(by_alias=True)
