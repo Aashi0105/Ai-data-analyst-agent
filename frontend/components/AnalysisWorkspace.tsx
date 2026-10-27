@@ -7,6 +7,7 @@ import { ResultVisualization } from "./ResultVisualization";
 import { CodeAuditPanel } from "./CodeAuditPanel";
 import { QueryHistory } from "./QueryHistory";
 import { DatasetUnderstandingCard } from "./DatasetUnderstandingCard";
+import { DatasetOverviewCard } from "./DatasetOverviewCard";
 import { AutomaticInsights } from "./AutomaticInsights";
 import { AnalyticalExplanationCard } from "./AnalyticalExplanationCard";
 import { Send, Sparkles, AlertCircle, Loader2, Table2 } from "lucide-react";
@@ -89,6 +90,16 @@ export const AnalysisWorkspace: React.FC<AnalysisWorkspaceProps> = ({ dataset })
           Explore {dataset.filename.replace(" (Sample)", "")}
         </h1>
       </div>
+
+      {/* Dedicated Dataset Overview Card */}
+      <DatasetOverviewCard
+        dataset={dataset}
+        onSelectQuery={(q) => {
+          setQuestion(q);
+          handleAnalyze(q);
+        }}
+        isLoading={isLoading}
+      />
 
       {/* Dataset Understanding Card */}
       {dataset.understanding && (

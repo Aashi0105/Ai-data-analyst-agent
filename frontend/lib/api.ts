@@ -1,4 +1,4 @@
-import { DatasetMetadata, AnalyzeResponse, Insight } from "@/types";
+import { DatasetMetadata, AnalyzeResponse, Insight, DatasetOverview } from "@/types";
 
 // Centralized API base URL configuration
 // Accepts: http://localhost:8000, http://localhost:8000/, http://localhost:8000/api
@@ -122,6 +122,19 @@ export async function getDatasetInsights(datasetId: string): Promise<Insight[]> 
   if (!res.ok) {
     const err = await res.json().catch(() => ({ detail: "Failed to fetch insights" }));
     throw new Error(err.detail || "Failed to fetch insights");
+  }
+
+  return res.json();
+}
+
+export async function getDatasetOverview(datasetId: string): Promise<DatasetOverview> {
+  const res = await safeFetch(`${API_BASE}/datasets/${datasetId}/overview`, {
+    method: "GET",
+  });
+
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ detail: "Failed to fetch dataset overview" }));
+    throw new Error(err.detail || "Failed to fetch dataset overview");
   }
 
   return res.json();

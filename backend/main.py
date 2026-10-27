@@ -32,6 +32,7 @@ from profiler import DatasetProfile, profile_dataset
 from understanding import DatasetUnderstanding, generate_dataset_understanding, generate_deterministic_fallback
 from insights import Insight, discover_insights
 from explanation import AnswerExplanation, explain_answer
+from overview import DatasetOverview, generate_dataset_overview
 from agent import DataAnalystAgent
 
 logger = logging.getLogger(__name__)
@@ -120,6 +121,8 @@ class DatasetMetadataResponse(BaseModel):
     profile: Optional[DatasetProfile] = None
     understanding: Optional[DatasetUnderstanding] = None
     insights: Optional[List[Insight]] = None
+    overview: Optional[DatasetOverview] = None
+
 
 
 class DeleteDatasetResponse(BaseModel):
@@ -189,8 +192,9 @@ def _format_dataset_response(
     profile: Optional[DatasetProfile] = None,
     understanding: Optional[DatasetUnderstanding] = None,
     insights: Optional[List[Insight]] = None,
+    overview: Optional[DatasetOverview] = None,
 ) -> DatasetMetadataResponse:
-    """Extracts summary, computes profile/understanding/insights if absent, and formats Pydantic response."""
+    """Extracts summary, computes profile/understanding/insights/overview if absent, and formats Pydantic response."""
     summary = get_dataset_summary(df)
 
     schema_list = []
@@ -212,6 +216,8 @@ def _format_dataset_response(
         understanding = generate_dataset_understanding(df, profile)
     if insights is None:
         insights = discover_insights(df, profile)
+    if overview is None:
+        overview = generate_dataset_overview(df, profile)
 
     return DatasetMetadataResponse(
         dataset_id=dataset_id,
@@ -227,7 +233,9 @@ def _format_dataset_response(
         profile=profile,
         understanding=understanding,
         insights=insights,
+        overview=overview,
     )
+
 
 
 # ============================================================================
@@ -303,13 +311,15 @@ async def upload_dataset(request: Request, file: UploadFile = File(...)) -> Data
         )
 
     try:
-        # Profile dataset, generate grounded understanding, and discover insights
+        # Profile dataset, generate grounded understanding, discover insights, and generate overview
         profile = profile_dataset(df)
         understanding = generate_dataset_understanding(df, profile)
         insights = discover_insights(df, profile)
+        overview = generate_dataset_overview(df, profile)
         stored.profile = profile
         stored.understanding = understanding
         stored.insights = insights
+        stored.overview = overview
     except Exception as e:
         # Rollback: avoid retaining orphaned dataset in store if profiling throws an unhandled error
         try:
@@ -320,7 +330,7 @@ async def upload_dataset(request: Request, file: UploadFile = File(...)) -> Data
 
     return _format_dataset_response(
         dataset_id, file.filename, df,
-        profile=profile, understanding=understanding, insights=insights
+        profile=profile, understanding=understanding, insights=insights, overview=overview
     )
 
 
@@ -341,9 +351,11 @@ def load_sample_dataset() -> DatasetMetadataResponse:
             existing.understanding = generate_dataset_understanding(existing.df, existing.profile)
         if not existing.insights:
             existing.insights = discover_insights(existing.df, existing.profile)
+        if not existing.overview:
+            existing.overview = generate_dataset_overview(existing.df, existing.profile)
         return _format_dataset_response(
             existing.dataset_id, existing.filename, existing.df,
-            profile=existing.profile, understanding=existing.understanding, insights=existing.insights
+            profile=existing.profile, understanding=existing.understanding, insights=existing.insights, overview=existing.overview
         )
 
     sample_path = os.path.join(WORKSPACE_ROOT, "data", "ecommerce_sales.csv")
@@ -365,6 +377,8 @@ def load_sample_dataset() -> DatasetMetadataResponse:
             stored.understanding = generate_dataset_understanding(stored.df, stored.profile)
         if not stored.insights:
             stored.insights = discover_insights(stored.df, stored.profile)
+        if not stored.overview:
+            stored.overview = generate_dataset_overview(stored.df, stored.profile)
     except StorageCapacityExhaustedError as e:
         raise HTTPException(
             status_code=503,
@@ -373,13 +387,13 @@ def load_sample_dataset() -> DatasetMetadataResponse:
 
     return _format_dataset_response(
         stored.dataset_id, stored.filename, stored.df,
-        profile=stored.profile, understanding=stored.understanding, insights=stored.insights
+        profile=stored.profile, understanding=stored.understanding, insights=stored.insights, overview=stored.overview
     )
 
 
 @app.get("/api/datasets/{dataset_id}", response_model=DatasetMetadataResponse)
 def get_dataset(dataset_id: str) -> DatasetMetadataResponse:
-    """Retrieves dataset summary, schema, profile, understanding, and insights for an active session."""
+    """Retrieves dataset summary, schema, profile, understanding, insights, and overview for an active session."""
     try:
         stored = DATASET_STORE.get(dataset_id)
         if not stored.profile:
@@ -388,9 +402,11 @@ def get_dataset(dataset_id: str) -> DatasetMetadataResponse:
             stored.understanding = generate_dataset_understanding(stored.df, stored.profile)
         if not stored.insights:
             stored.insights = discover_insights(stored.df, stored.profile)
+        if not stored.overview:
+            stored.overview = generate_dataset_overview(stored.df, stored.profile)
         return _format_dataset_response(
             dataset_id, stored.filename, stored.df,
-            profile=stored.profile, understanding=stored.understanding, insights=stored.insights
+            profile=stored.profile, understanding=stored.understanding, insights=stored.insights, overview=stored.overview
         )
     except DatasetSessionExpiredError:
         raise HTTPException(status_code=404, detail="Dataset session expired. Please re-upload your CSV.")
@@ -408,6 +424,22 @@ def get_dataset_understanding_endpoint(dataset_id: str) -> DatasetUnderstanding:
         if not stored.understanding:
             stored.understanding = generate_dataset_understanding(stored.df, stored.profile)
         return stored.understanding
+    except DatasetSessionExpiredError:
+        raise HTTPException(status_code=404, detail="Dataset session expired. Please re-upload your CSV.")
+    except DatasetNotFoundError:
+        raise HTTPException(status_code=404, detail=f"Dataset with ID '{dataset_id}' was not found in server memory.")
+
+
+@app.get("/api/datasets/{dataset_id}/overview", response_model=DatasetOverview)
+def get_dataset_overview_endpoint(dataset_id: str) -> DatasetOverview:
+    """Retrieves or automatically generates dedicated dataset overview."""
+    try:
+        stored = DATASET_STORE.get(dataset_id)
+        if not stored.profile:
+            stored.profile = profile_dataset(stored.df)
+        if not stored.overview:
+            stored.overview = generate_dataset_overview(stored.df, stored.profile)
+        return stored.overview
     except DatasetSessionExpiredError:
         raise HTTPException(status_code=404, detail="Dataset session expired. Please re-upload your CSV.")
     except DatasetNotFoundError:

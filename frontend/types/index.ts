@@ -106,6 +106,42 @@ export interface Insight {
   score: number;
 }
 
+export interface KeyField {
+  name: string;
+  meaning: string;
+  type_info?: string | null;
+  role?: "identifier" | "metric" | "dimension" | "temporal" | "attribute" | string | null;
+}
+
+export interface AnalysisOpportunity {
+  title: string;
+  description: string;
+  business_value: string;
+  sample_question?: string | null;
+}
+
+export interface PredictionCandidate {
+  task: string;
+  target_variable?: string | null;
+  prerequisites: string;
+  feasibility: "Feasible for exploration" | "Feasible with caveats" | "Requires additional data" | "Not currently supported by the data" | "Low feasibility" | string;
+  missing_elements: string[];
+}
+
+export interface DatasetOverview {
+  domain: string;
+  domain_confidence: "high" | "medium" | "low" | string;
+  domain_rationale?: string | null;
+  summary_paragraph: string;
+  row_meaning: string;
+  size_and_coverage: string;
+  key_fields: KeyField[];
+  what_we_can_learn: AnalysisOpportunity[];
+  potential_predictions: PredictionCandidate[];
+  prediction_limitations: string;
+  status: "deterministic" | "synthesized";
+}
+
 export interface DatasetMetadata {
   dataset_id: string;
   filename: string;
@@ -120,6 +156,7 @@ export interface DatasetMetadata {
   profile?: DatasetProfile;
   understanding?: DatasetUnderstanding;
   insights?: Insight[];
+  overview?: DatasetOverview;
 }
 
 
