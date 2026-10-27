@@ -31,6 +31,7 @@ from utils import load_csv, get_dataset_summary, format_value
 from profiler import DatasetProfile, profile_dataset
 from understanding import DatasetUnderstanding, generate_dataset_understanding, generate_deterministic_fallback
 from insights import Insight, discover_insights
+from explanation import AnswerExplanation, explain_answer
 from agent import DataAnalystAgent
 
 logger = logging.getLogger(__name__)
@@ -157,6 +158,7 @@ class AnalyzeResponse(BaseModel):
     table_data: Optional[TableData] = None
     visualization: Optional[VisualizationData] = None
     execution_time_ms: int
+    explanation: Optional[AnswerExplanation] = None
 
 
 # ============================================================================
@@ -587,6 +589,18 @@ def analyze_data(request: AnalyzeRequest) -> AnalyzeResponse:
                 result_type = "other"
                 formatted_result = str(res)
 
+            # Stage 5: Analytical Explanation (Feature A)
+            explanation_obj = None
+            try:
+                explanation_obj = explain_answer(
+                    result=res,
+                    df=df,
+                    question=user_question,
+                    use_gemini=True
+                )
+            except Exception as exp_err:
+                logger.warning("Explanation generation failed gracefully: %s", exp_err)
+
             return AnalyzeResponse(
                 question=user_question,
                 code=cleaned_code,
@@ -597,7 +611,8 @@ def analyze_data(request: AnalyzeRequest) -> AnalyzeResponse:
                 formatted_result=formatted_result,
                 table_data=table_data,
                 visualization=viz_data,
-                execution_time_ms=elapsed_ms
+                execution_time_ms=elapsed_ms,
+                explanation=explanation_obj
             )
 
     except DatasetSessionExpiredError:

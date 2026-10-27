@@ -8,6 +8,7 @@ import { CodeAuditPanel } from "./CodeAuditPanel";
 import { QueryHistory } from "./QueryHistory";
 import { DatasetUnderstandingCard } from "./DatasetUnderstandingCard";
 import { AutomaticInsights } from "./AutomaticInsights";
+import { AnalyticalExplanationCard } from "./AnalyticalExplanationCard";
 import { Send, Sparkles, AlertCircle, Loader2, Table2 } from "lucide-react";
 
 
@@ -239,6 +240,17 @@ export const AnalysisWorkspace: React.FC<AnalysisWorkspaceProps> = ({ dataset })
           <div className="text-2xl sm:text-3xl font-serif text-charcoal font-medium leading-snug">
             {currentResult.formatted_result}
           </div>
+
+          {/* Analytical Significance & Empirical Evidence (Feature A) */}
+          {currentResult.explanation && (
+            <AnalyticalExplanationCard
+              explanation={currentResult.explanation}
+              onSelectNextStep={(nextQuestion) => {
+                setQuestion(nextQuestion);
+                window.scrollTo({ top: 0, behavior: "smooth" });
+              }}
+            />
+          )}
 
           {/* Tabular Output (if DataFrame or Series) */}
           {currentResult.table_data && currentResult.table_data.rows.length > 0 && (

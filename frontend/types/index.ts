@@ -136,6 +136,39 @@ export interface VisualizationData {
   title: string;
 }
 
+export interface AnswerEvidence {
+  metric_name?: string | null;
+  aggregation_type: string;
+  is_additive: boolean;
+  total_value?: number | null;
+  denominator_description?: string | null;
+  top_contributor?: string | null;
+  top_value?: number | null;
+  top_share_pct?: number | null;
+  runner_up?: string | null;
+  runner_up_value?: number | null;
+  runner_up_share_pct?: number | null;
+  bottom_contributor?: string | null;
+  bottom_value?: number | null;
+  disparity_ratio?: number | null;
+  disparity_difference?: number | null;
+  num_groups?: number | null;
+  sample_size?: number | null;
+  baseline_value?: number | null;
+  baseline_description?: string | null;
+  key_figures?: Record<string, any>;
+  limitation_notes?: string | null;
+}
+
+export interface AnswerExplanation {
+  finding: string;
+  evidence: AnswerEvidence;
+  interpretation: string;
+  uncertainty_or_limitations?: string | null;
+  next_steps: string[];
+  status: "deterministic" | "synthesized";
+}
+
 export interface AnalyzeResponse {
   question: string;
   code: string;
@@ -148,6 +181,7 @@ export interface AnalyzeResponse {
   table_data?: TableData | null;
   visualization?: VisualizationData | null;
   execution_time_ms: number;
+  explanation?: AnswerExplanation | null;
 }
 
 export interface HistoryItem {
