@@ -84,6 +84,28 @@ export interface DatasetUnderstanding {
   status: "generated" | "fallback";
 }
 
+export interface InsightEvidence {
+
+  metric_name: string;
+  relevant_columns: string[];
+  key_figures: Record<string, any>;
+  sample_size?: number | null;
+  comparison_basis?: string | null;
+}
+
+export interface Insight {
+  id: string;
+  type: "segmentation" | "trend" | "outlier" | "correlation" | "data_quality";
+  headline: string;
+  explanation: string;
+  why_it_matters: string;
+  uncertainty_or_limitations?: string | null;
+  evidence: InsightEvidence;
+  visualization?: VisualizationData | null;
+  suggested_query?: string | null;
+  score: number;
+}
+
 export interface DatasetMetadata {
   dataset_id: string;
   filename: string;
@@ -97,7 +119,9 @@ export interface DatasetMetadata {
   preview: Record<string, any>[];
   profile?: DatasetProfile;
   understanding?: DatasetUnderstanding;
+  insights?: Insight[];
 }
+
 
 export interface TableData {
   columns: string[];

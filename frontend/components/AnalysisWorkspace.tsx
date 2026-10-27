@@ -7,7 +7,9 @@ import { ResultVisualization } from "./ResultVisualization";
 import { CodeAuditPanel } from "./CodeAuditPanel";
 import { QueryHistory } from "./QueryHistory";
 import { DatasetUnderstandingCard } from "./DatasetUnderstandingCard";
+import { AutomaticInsights } from "./AutomaticInsights";
 import { Send, Sparkles, AlertCircle, Loader2, Table2 } from "lucide-react";
+
 
 interface AnalysisWorkspaceProps {
   dataset: DatasetMetadata;
@@ -98,6 +100,19 @@ export const AnalysisWorkspace: React.FC<AnalysisWorkspaceProps> = ({ dataset })
           isLoading={isLoading}
         />
       )}
+
+      {/* Automatic Insights Discovery Section */}
+      {dataset.insights && dataset.insights.length > 0 && (
+        <AutomaticInsights
+          insights={dataset.insights}
+          onSelectQuery={(q) => {
+            setQuestion(q);
+            handleAnalyze(q);
+          }}
+          isLoading={isLoading}
+        />
+      )}
+
 
       {/* Query Input Card */}
       <div className="border border-editorial-border rounded-lg bg-surface p-4 shadow-sm">
