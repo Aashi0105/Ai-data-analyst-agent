@@ -236,6 +236,223 @@ def test_analyze_quota_exceeded_structured_error(client, monkeypatch):
 
 
 # ============================================================================
+# End-to-End Analysis Pipeline Verification (/api/analyze)
+# ============================================================================
+
+def test_analyze_successful_end_to_end_pipeline(client, monkeypatch):
+    """
+    Verify complete successful end-to-end analysis pipeline:
+    DataAnalystAgent (mocked) -> AST validation (real) -> Sandbox execution (real)
+    -> Result formatting (real) -> Recharts visualization builder (real) -> explain_answer (mocked).
+    Asserts regional revenue values match independently verified figures for ecommerce_sales.csv.
+    """
+    import backend.main as backend_main
+    from agent import DataAnalystAgent
+    from explanation import AnswerExplanation, AnswerEvidence
+
+    # 1. Load sample ecommerce dataset (100 rows, 13 columns)
+    sample_res = client.post("/api/datasets/sample")
+    assert sample_res.status_code == 200
+    dataset_id = sample_res.json()["dataset_id"]
+
+    # 2. Candidate code accepted by AST validator
+    candidate_code = "result = df.groupby('region')['revenue'].sum().sort_values(ascending=False).reset_index()"
+
+    monkeypatch.setattr(
+        DataAnalystAgent,
+        "generate_code",
+        lambda self, df, q, max_retries=3: candidate_code
+    )
+
+    mock_exp = AnswerExplanation(
+        finding="North region generated the highest revenue ($16,886.30), followed by West ($12,664.85), South ($12,607.00), and East ($11,190.70).",
+        evidence=AnswerEvidence(
+            metric_name="revenue",
+            aggregation_type="sum",
+            is_additive=True,
+            total_value=53348.85,
+            top_contributor="North",
+            top_value=16886.30,
+            runner_up="West",
+            runner_up_value=12664.85,
+            bottom_contributor="East",
+            bottom_value=11190.70,
+            num_groups=4,
+            sample_size=100
+        ),
+        interpretation="North accounted for approximately 31.7% of total regional revenue.",
+        uncertainty_or_limitations="Observational aggregation without causal controls.",
+        next_steps=["Examine product category breakdowns within the North region."],
+        status="deterministic"
+    )
+    monkeypatch.setattr(backend_main, "explain_answer", lambda **kwargs: mock_exp)
+
+    # 3. Dispatch analytical query
+    response = client.post(
+        "/api/analyze",
+        json={"dataset_id": dataset_id, "question": "What is the total revenue by region?"}
+    )
+
+    # 4. Assert HTTP & Pipeline Statuses
+    assert response.status_code == 200
+    data = response.json()
+    assert data["validation_status"] == "passed"
+    assert data["validation_message"] == "Code passed AST validation."
+    assert data["execution_status"] == "passed"
+    assert data["error_message"] is None
+    assert data["result_type"] == "dataframe"
+    assert data["code"] == candidate_code
+    assert data["execution_time_ms"] >= 0
+
+    # 5. Assert Independently Verified Regional Revenue Values
+    table = data["table_data"]
+    assert table is not None
+    assert table["columns"] == ["region", "revenue"]
+    rows = table["rows"]
+    assert len(rows) == 4
+
+    row_map = {r["region"]: round(float(r["revenue"]), 2) for r in rows}
+    assert row_map["North"] == 16886.30
+    assert row_map["West"] == 12664.85
+    assert row_map["South"] == 12607.00
+    assert row_map["East"] == 11190.70
+
+    # 6. Assert Recharts Visualization Data
+    viz = data["visualization"]
+    assert viz is not None
+    assert viz["chart_type"] == "Bar Chart"
+    assert viz["x_key"] == "label"
+    assert viz["y_keys"] == ["value"]
+    assert "revenue by region" in viz["title"]
+
+    viz_map = {d["label"]: round(float(d["value"]), 2) for d in viz["data"]}
+    assert viz_map["North"] == 16886.30
+    assert viz_map["West"] == 12664.85
+    assert viz_map["South"] == 12607.00
+    assert viz_map["East"] == 11190.70
+
+    # 7. Assert Explanation Model
+    assert data["explanation"] is not None
+    assert data["explanation"]["finding"] == mock_exp.finding
+    assert data["explanation"]["evidence"]["top_contributor"] == "North"
+    assert data["explanation"]["evidence"]["top_value"] == 16886.30
+
+
+def test_analyze_ast_security_violation_handled(client, monkeypatch):
+    """Verify that code violating the AST safety whitelist is rejected without executing in the sandbox."""
+    sample_res = client.post("/api/datasets/sample")
+    dataset_id = sample_res.json()["dataset_id"]
+
+    from agent import DataAnalystAgent
+    # Disallowed import in generated code
+    monkeypatch.setattr(
+        DataAnalystAgent,
+        "generate_code",
+        lambda self, df, q, max_retries=3: "import os\nresult = df.head()"
+    )
+
+    response = client.post(
+        "/api/analyze",
+        json={"dataset_id": dataset_id, "question": "Attempt malicious import"}
+    )
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["validation_status"] == "failed"
+    assert data["execution_status"] == "failed"
+    assert "AST Security Violation" in data["error_message"]
+    assert data["table_data"] is None
+    assert data["visualization"] is None
+    assert data["explanation"] is None
+
+
+def test_analyze_sandbox_execution_error_handled(client, monkeypatch):
+    """Verify that valid AST code causing runtime sandbox errors is captured cleanly."""
+    sample_res = client.post("/api/datasets/sample")
+    dataset_id = sample_res.json()["dataset_id"]
+
+    from agent import DataAnalystAgent
+    # Code passes AST check but references a nonexistent column
+    monkeypatch.setattr(
+        DataAnalystAgent,
+        "generate_code",
+        lambda self, df, q, max_retries=3: "result = df['non_existent_column_for_testing'].sum()"
+    )
+
+    response = client.post(
+        "/api/analyze",
+        json={"dataset_id": dataset_id, "question": "Calculate missing column"}
+    )
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["validation_status"] == "passed"
+    assert data["execution_status"] == "failed"
+    assert data["error_message"] is not None
+    assert "non_existent_column_for_testing" in data["error_message"]
+    assert data["table_data"] is None
+    assert data["visualization"] is None
+    assert data["explanation"] is None
+
+
+def test_analyze_graceful_degradation_on_explanation_failure(client, monkeypatch):
+    """Verify that when explanation synthesis throws an error, the core analysis response still succeeds."""
+    import backend.main as backend_main
+    from agent import DataAnalystAgent
+
+    sample_res = client.post("/api/datasets/sample")
+    dataset_id = sample_res.json()["dataset_id"]
+
+    monkeypatch.setattr(
+        DataAnalystAgent,
+        "generate_code",
+        lambda self, df, q, max_retries=3: "result = df['revenue'].sum()"
+    )
+
+    def mock_failing_explain(**kwargs):
+        raise RuntimeError("Explanation LLM synthesis timed out.")
+
+    monkeypatch.setattr(backend_main, "explain_answer", mock_failing_explain)
+
+    response = client.post(
+        "/api/analyze",
+        json={"dataset_id": dataset_id, "question": "What is total revenue?"}
+    )
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["validation_status"] == "passed"
+    assert data["execution_status"] == "passed"
+    assert data["result_type"] == "scalar"
+    assert data["explanation"] is None  # Degraded gracefully
+
+
+def test_analyze_generic_code_generation_error_handled(client, monkeypatch):
+    """Verify that generic non-quota code generation errors return an execution failure response."""
+    sample_res = client.post("/api/datasets/sample")
+    dataset_id = sample_res.json()["dataset_id"]
+
+    from agent import DataAnalystAgent
+
+    def mock_failing_generate(self, df, q, max_retries=3):
+        raise ValueError("Invalid prompt parameters generated by client.")
+
+    monkeypatch.setattr(DataAnalystAgent, "generate_code", mock_failing_generate)
+
+    response = client.post(
+        "/api/analyze",
+        json={"dataset_id": dataset_id, "question": "Trigger generic error"}
+    )
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["validation_status"] == "failed"
+    assert data["validation_message"] == "Code generation failed."
+    assert data["execution_status"] == "failed"
+    assert "Code generation error" in data["error_message"]
+
+
+# ============================================================================
 # Bounded Dataset Storage Tests (Task 08A.2.2 & 08A.2.3)
 # ============================================================================
 
