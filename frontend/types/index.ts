@@ -219,6 +219,21 @@ export interface AnalyzeResponse {
   visualization?: VisualizationData | null;
   execution_time_ms: number;
   explanation?: AnswerExplanation | null;
+  quota_exhausted?: boolean;
+  session_limit_reached?: boolean;
+  examples_available?: boolean;
+  message?: string;
+  result?: any;
+  chart?: any;
+}
+
+export interface SavedExample {
+  question: string;
+  answer_text: string;
+  chart_type: string;
+  chart_data?: VisualizationData | any;
+  label: string;
+  is_example: boolean;
 }
 
 export interface HistoryItem {

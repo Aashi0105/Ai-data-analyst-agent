@@ -1100,3 +1100,102 @@ def test_recharts_infinity_and_truncation_handling():
     assert viz_many is not None
     assert len(viz_many["data"]) == 30
     assert "(Top 30)" in viz_many["title"]
+
+
+def test_examples_endpoint_returns_five_results(client):
+    """Verify GET /api/examples returns 5 pre-calculated examples in under 100ms without calling Gemini."""
+    import time
+    start = time.perf_counter()
+    response = client.get("/api/examples")
+    duration = time.perf_counter() - start
+
+    assert response.status_code == 200
+    assert duration < 0.1  # Under 100ms requirement
+
+    examples = response.json()
+    assert isinstance(examples, list)
+    assert len(examples) == 5
+
+    for ex in examples:
+        assert "question" in ex and isinstance(ex["question"], str) and len(ex["question"]) > 0
+        assert "answer_text" in ex and isinstance(ex["answer_text"], str) and len(ex["answer_text"]) > 0
+        assert ex["chart_type"] in ["bar", "line", "pie", "none"]
+        assert "chart_data" in ex and isinstance(ex["chart_data"], dict)
+        assert "data" in ex["chart_data"]
+        assert ex.get("label") == "Saved Example — E-commerce Sales Dataset"
+        assert ex.get("is_example") is True
+
+
+def test_quota_exhaustion_returns_structured_response(client, monkeypatch):
+    """Verify that when live Gemini quota is exhausted, POST /api/analyze returns HTTP 200 with structured quota info."""
+    sample_res = client.post("/api/datasets/sample")
+    assert sample_res.status_code == 200
+    ds_id = sample_res.json()["dataset_id"]
+
+    from agent import DataAnalystAgent
+
+    def mock_generate_code(self, df, question, max_retries=3):
+        raise RuntimeError(
+            "429 Resource has been exhausted (e.g. check quota). "
+            "GenerateRequestsPerDayPerModel-FreeTier quota exhausted."
+        )
+
+    monkeypatch.setattr(DataAnalystAgent, "generate_code", mock_generate_code)
+
+    response = client.post(
+        "/api/analyze",
+        json={"dataset_id": ds_id, "question": "Which region has the highest total revenue?"}
+    )
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["quota_exhausted"] is True
+    assert data["examples_available"] is True
+    assert "Daily analysis limit reached" in data["message"]
+    assert data["result"] is None
+    assert data["chart"] is None
+    assert data["explanation"] is None
+
+
+def test_rate_limit_blocks_sixth_request(client, monkeypatch):
+    """Verify in-memory rate limiting blocks the 6th request per dataset per UTC day with HTTP 200."""
+    import backend.main as backend_main
+    from agent import DataAnalystAgent
+
+    # Fresh dataset ID
+    sample_res = client.post("/api/datasets/sample")
+    assert sample_res.status_code == 200
+    ds_id = sample_res.json()["dataset_id"]
+
+    # Reset rate limit counter for this dataset to test from a clean slate
+    backend_main._rate_limits[ds_id] = {"count": 0, "date": "2026-01-01"}
+
+    # Mock DataAnalystAgent and explain_answer to return immediately
+    monkeypatch.setattr(
+        DataAnalystAgent,
+        "generate_code",
+        lambda self, df, q, max_retries=3: "result = df['revenue'].sum()"
+    )
+    monkeypatch.setattr(backend_main, "explain_answer", lambda *args, **kwargs: None)
+
+    # First 5 requests must pass
+    for i in range(5):
+        res = client.post(
+            "/api/analyze",
+            json={"dataset_id": ds_id, "question": f"Question {i+1}"}
+        )
+        assert res.status_code == 200
+        body = res.json()
+        assert body.get("session_limit_reached") is not True
+
+    # 6th request must be rate-limited
+    res6 = client.post(
+        "/api/analyze",
+        json={"dataset_id": ds_id, "question": "Question 6"}
+    )
+    assert res6.status_code == 200
+    body6 = res6.json()
+    assert body6.get("session_limit_reached") is True
+    assert body6.get("examples_available") is True
+    assert "5 daily analyses" in body6.get("message", "")
+    assert body6.get("result") is None

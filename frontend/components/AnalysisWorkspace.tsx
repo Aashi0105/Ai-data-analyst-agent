@@ -1,8 +1,8 @@
 "use client";
 
-import React, { useState } from "react";
-import { DatasetMetadata, AnalyzeResponse, HistoryItem } from "@/types";
-import { analyzeQuery } from "@/lib/api";
+import React, { useState, useEffect } from "react";
+import { DatasetMetadata, AnalyzeResponse, HistoryItem, SavedExample } from "@/types";
+import { analyzeQuery, getExamples } from "@/lib/api";
 import { ResultVisualization } from "./ResultVisualization";
 import { CodeAuditPanel } from "./CodeAuditPanel";
 import { QueryHistory } from "./QueryHistory";
@@ -17,14 +17,51 @@ interface AnalysisWorkspaceProps {
   dataset: DatasetMetadata;
 }
 
+const LOADING_MESSAGES = [
+  "Reading your question...",
+  "Generating analysis code...",
+  "Running the calculation safely...",
+  "Almost done — complex questions take 15-20 seconds...",
+];
+
 export const AnalysisWorkspace: React.FC<AnalysisWorkspaceProps> = ({ dataset }) => {
   const [question, setQuestion] = useState("");
   const [isLoading, setIsLoading] = useState(false);
+  const [loadingStep, setLoadingStep] = useState(0);
   const [currentResult, setCurrentResult] = useState<AnalyzeResponse | null>(null);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [isQuotaExceeded, setIsQuotaExceeded] = useState(false);
+  const [quotaMessage, setQuotaMessage] = useState<string | null>(null);
+  const [savedExamples, setSavedExamples] = useState<SavedExample[]>([]);
+  const [activeExampleIndex, setActiveExampleIndex] = useState(0);
   const [history, setHistory] = useState<HistoryItem[]>([]);
   const [activeHistoryId, setActiveHistoryId] = useState<string | undefined>();
+
+  // Cycle through loading messages while query is running
+  useEffect(() => {
+    if (!isLoading) {
+      setLoadingStep(0);
+      return;
+    }
+
+    setLoadingStep(0);
+    const t1 = setTimeout(() => setLoadingStep(1), 3000);
+    const t2 = setTimeout(() => setLoadingStep(2), 8000);
+    const t3 = setTimeout(() => setLoadingStep(3), 15000);
+
+    return () => {
+      clearTimeout(t1);
+      clearTimeout(t2);
+      clearTimeout(t3);
+    };
+  }, [isLoading]);
+
+  // Load saved examples when quota is exceeded or rate limit reached
+  useEffect(() => {
+    if (isQuotaExceeded && savedExamples.length === 0) {
+      getExamples().then(setSavedExamples).catch(console.error);
+    }
+  }, [isQuotaExceeded, savedExamples.length]);
 
   const handleAnalyze = async (queryText?: string) => {
     const q = (queryText || question).trim();
@@ -36,6 +73,22 @@ export const AnalysisWorkspace: React.FC<AnalysisWorkspaceProps> = ({ dataset })
 
     try {
       const response = await analyzeQuery(dataset.dataset_id, q);
+
+      if (response.quota_exhausted || response.session_limit_reached) {
+        setIsQuotaExceeded(true);
+        setQuotaMessage(
+          response.message ||
+            "Daily analysis limit reached. Explore the saved examples below to see what this tool can do."
+        );
+        try {
+          const examples = await getExamples();
+          setSavedExamples(examples);
+        } catch (e) {
+          console.error("Failed to fetch saved examples", e);
+        }
+        setCurrentResult(null);
+        return;
+      }
 
       if (response.execution_status === "failed" || response.validation_status === "failed") {
         setErrorMessage(response.error_message || response.validation_message || "Analysis could not be completed.");
@@ -54,8 +107,15 @@ export const AnalysisWorkspace: React.FC<AnalysisWorkspaceProps> = ({ dataset })
       setHistory((prev) => [historyEntry, ...prev.filter((h) => h.question !== q)]);
       setActiveHistoryId(historyEntry.id);
     } catch (err: any) {
-      if (err.errorType === "quota_exceeded" || err.isQuota || err.message?.includes("usage limit") || err.message?.includes("quota")) {
+      if (err.errorType === "quota_exceeded" || err.isQuota || err.message?.includes("usage limit") || err.message?.includes("quota") || err.status === 429) {
         setIsQuotaExceeded(true);
+        setQuotaMessage(err.message || "Live analysis unavailable — showing saved examples from the sample dataset.");
+        try {
+          const examples = await getExamples();
+          setSavedExamples(examples);
+        } catch (e) {
+          console.error("Failed to fetch saved examples", e);
+        }
       } else {
         setErrorMessage(err.message || "Failed to communicate with analysis engine.");
       }
@@ -140,15 +200,26 @@ export const AnalysisWorkspace: React.FC<AnalysisWorkspaceProps> = ({ dataset })
               type="text"
               value={question}
               onChange={(e) => setQuestion(e.target.value)}
-              placeholder="Ask anything about your data... (e.g. Which region generated the most revenue?)"
-              disabled={isLoading}
-              className="w-full px-4 py-3 text-sm text-charcoal bg-cream/40 border border-editorial-border rounded focus:outline-none focus:border-editorial-accent focus:ring-1 focus:ring-editorial-accent transition font-sans"
+              placeholder={
+                isQuotaExceeded
+                  ? "Analysis paused — quota reached. Come back tomorrow for live analysis."
+                  : "Ask anything about your data... (e.g. Which region generated the most revenue?)"
+              }
+              title={
+                isQuotaExceeded
+                  ? "Analysis paused — quota reached. Come back tomorrow for live analysis."
+                  : undefined
+              }
+              disabled={isLoading || isQuotaExceeded}
+              className={`w-full px-4 py-3 text-sm text-charcoal bg-cream/40 border border-editorial-border rounded focus:outline-none focus:border-editorial-accent focus:ring-1 focus:ring-editorial-accent transition font-sans ${
+                isQuotaExceeded ? "opacity-60 bg-stone-100 cursor-not-allowed" : ""
+              }`}
             />
           </div>
 
           <button
             type="submit"
-            disabled={isLoading || !question.trim()}
+            disabled={isLoading || !question.trim() || isQuotaExceeded}
             className="px-6 py-3 bg-editorial-accent hover:bg-[#153427] text-white text-xs font-medium tracking-wide uppercase rounded transition flex items-center justify-center space-x-2 disabled:opacity-50 shrink-0"
           >
             {isLoading ? (
@@ -179,8 +250,8 @@ export const AnalysisWorkspace: React.FC<AnalysisWorkspaceProps> = ({ dataset })
                 setQuestion(prompt);
                 handleAnalyze(prompt);
               }}
-              disabled={isLoading}
-              className="text-[11px] text-charcoal-muted hover:text-charcoal hover:bg-editorial-hover px-2.5 py-1 rounded border border-editorial-border/80 transition"
+              disabled={isLoading || isQuotaExceeded}
+              className="text-[11px] text-charcoal-muted hover:text-charcoal hover:bg-editorial-hover px-2.5 py-1 rounded border border-editorial-border/80 transition disabled:opacity-40 disabled:cursor-not-allowed"
             >
               {prompt}
             </button>
@@ -192,33 +263,113 @@ export const AnalysisWorkspace: React.FC<AnalysisWorkspaceProps> = ({ dataset })
       {isLoading && (
         <div className="mt-8 p-8 border border-editorial-border rounded-lg bg-surface flex flex-col items-center justify-center space-y-3">
           <Loader2 className="w-6 h-6 animate-spin text-editorial-accent" />
-          <p className="text-sm font-medium text-charcoal">Analyzing your dataset…</p>
+          <p className="text-sm font-medium text-charcoal">{LOADING_MESSAGES[loadingStep]}</p>
           <p className="text-xs text-charcoal-muted font-light">
             Generating Pandas query, verifying AST safety rules, and executing in sandbox.
           </p>
         </div>
       )}
 
-      {/* Polished Quota Error State */}
+      {/* Polished Quota Error State with Saved Examples */}
       {isQuotaExceeded && !isLoading && (
-        <div className="mt-6 p-5 rounded-lg border border-amber-200/90 bg-[#FFFDF5] text-stone-800 shadow-sm">
-          <div className="flex items-start space-x-3.5">
-            <div className="p-2 rounded-md bg-amber-100/80 text-amber-800 shrink-0 mt-0.5">
-              <AlertCircle className="w-5 h-5 text-amber-700" />
-            </div>
+        <div className="mt-6 space-y-6">
+          {/* Yellow / Amber Banner */}
+          <div className="p-4 rounded-lg border border-amber-300 bg-amber-50/90 text-amber-950 shadow-sm flex items-start space-x-3.5">
+            <AlertCircle className="w-5 h-5 text-amber-600 shrink-0 mt-0.5" />
             <div className="space-y-1">
-              <h3 className="font-serif text-base font-medium text-stone-900">
-                Analysis temporarily unavailable
+              <h3 className="font-serif text-base font-semibold text-amber-950">
+                Live analysis unavailable — showing saved examples from the sample dataset
               </h3>
-              <p className="text-xs text-stone-600 leading-relaxed font-sans">
-                AI analysis has reached its current usage limit. Please try again later.
+              <p className="text-xs text-amber-800 leading-relaxed font-sans">
+                {quotaMessage ||
+                  "Daily analysis limit reached. Gemini's free tier resets daily. Explore the saved examples below to see what this tool can do."}
               </p>
-              <div className="mt-2.5 pt-2 border-t border-amber-200/60 flex items-center space-x-2 text-[11px] text-stone-500">
-                <span className="inline-block w-1.5 h-1.5 rounded-full bg-amber-500"></span>
-                <span>Gemini API Free Tier daily quota allocation reached (20 requests/day). Rate limits reset automatically.</span>
-              </div>
             </div>
           </div>
+
+          {/* Saved Examples Section */}
+          {savedExamples.length > 0 && (
+            <div className="space-y-4">
+              {/* Click-through Header & Tabs */}
+              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 border-b border-editorial-border pb-3">
+                <div className="flex items-center space-x-2">
+                  <span className="text-xs font-semibold uppercase tracking-wider text-charcoal-subtle">
+                    Saved Examples ({activeExampleIndex + 1} of {savedExamples.length})
+                  </span>
+                  <span className="inline-flex items-center px-2 py-0.5 rounded text-[10px] font-medium bg-stone-100 text-stone-600 border border-stone-200">
+                    Saved Example
+                  </span>
+                </div>
+                <div className="flex items-center space-x-2">
+                  <button
+                    type="button"
+                    onClick={() =>
+                      setActiveExampleIndex((prev) => (prev > 0 ? prev - 1 : savedExamples.length - 1))
+                    }
+                    className="px-2.5 py-1 text-xs border border-editorial-border rounded bg-surface hover:bg-editorial-hover text-charcoal transition"
+                  >
+                    ← Prev
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() =>
+                      setActiveExampleIndex((prev) => (prev < savedExamples.length - 1 ? prev + 1 : 0))
+                    }
+                    className="px-2.5 py-1 text-xs border border-editorial-border rounded bg-surface hover:bg-editorial-hover text-charcoal transition"
+                  >
+                    Next →
+                  </button>
+                </div>
+              </div>
+
+              {/* Pills for the 5 questions */}
+              <div className="flex flex-wrap gap-2">
+                {savedExamples.map((ex, idx) => (
+                  <button
+                    key={idx}
+                    type="button"
+                    onClick={() => setActiveExampleIndex(idx)}
+                    className={`px-3 py-1.5 rounded-full text-xs font-medium transition text-left ${
+                      activeExampleIndex === idx
+                        ? "bg-editorial-accent text-white shadow-sm"
+                        : "bg-surface border border-editorial-border text-charcoal-muted hover:text-charcoal hover:bg-stone-50"
+                    }`}
+                  >
+                    {ex.question}
+                  </button>
+                ))}
+              </div>
+
+              {/* Render Active Example (matches real result card) */}
+              {savedExamples[activeExampleIndex] && (
+                <div className="border border-editorial-border rounded-lg bg-surface p-6 shadow-sm">
+                  <div className="flex items-center justify-between pb-3 mb-4 border-b border-editorial-border">
+                    <div className="flex items-center space-x-2.5">
+                      <span className="text-xs uppercase tracking-wider text-charcoal-subtle font-semibold">
+                        {savedExamples[activeExampleIndex].question}
+                      </span>
+                      <span className="inline-flex items-center px-2 py-0.5 rounded text-[10px] font-medium bg-stone-100 text-stone-600 border border-stone-200">
+                        Saved Example
+                      </span>
+                    </div>
+                    <span className="text-[11px] text-charcoal-muted font-mono">
+                      {savedExamples[activeExampleIndex].label}
+                    </span>
+                  </div>
+
+                  {/* Prominent Answer Card */}
+                  <div className="text-2xl sm:text-3xl font-serif text-charcoal font-medium leading-snug">
+                    {savedExamples[activeExampleIndex].answer_text}
+                  </div>
+
+                  {/* Structured Recharts Visualization */}
+                  {savedExamples[activeExampleIndex].chart_data && (
+                    <ResultVisualization visualization={savedExamples[activeExampleIndex].chart_data} />
+                  )}
+                </div>
+              )}
+            </div>
+          )}
         </div>
       )}
 

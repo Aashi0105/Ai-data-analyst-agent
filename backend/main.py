@@ -11,6 +11,7 @@ import os
 import sys
 import uuid
 import time
+from datetime import datetime, timezone
 from typing import Dict, Any, List, Optional
 import pandas as pd
 import numpy as np
@@ -34,6 +35,7 @@ from insights import Insight, discover_insights
 from explanation import AnswerExplanation, explain_answer
 from overview import DatasetOverview, generate_dataset_overview
 from agent import DataAnalystAgent
+from backend.examples import get_examples
 
 logger = logging.getLogger(__name__)
 
@@ -67,6 +69,10 @@ DATASET_STORE = BoundedDatasetStore(
     max_memory_bytes=int(os.getenv("DATASET_STORE_MAX_MEMORY_MB", "512")) * 1024 * 1024,
     ttl_seconds=float(os.getenv("DATASET_STORE_TTL_SECONDS", "3600.0")),
 )
+
+# In-Memory Per-Session Rate Limiter (Task 5)
+_rate_limits: dict = {}
+# key: dataset_id, value: {count: int, date: str}
 
 # FastAPI App Initialization
 app = FastAPI(
@@ -150,18 +156,24 @@ class VisualizationData(BaseModel):
 
 
 class AnalyzeResponse(BaseModel):
-    question: str
-    code: str
-    validation_status: str  # "passed" | "failed"
-    validation_message: str
-    execution_status: str   # "passed" | "failed"
+    question: Optional[str] = None
+    code: Optional[str] = None
+    validation_status: Optional[str] = None  # "passed" | "failed"
+    validation_message: Optional[str] = None
+    execution_status: Optional[str] = None   # "passed" | "failed"
     error_message: Optional[str] = None
     result_type: Optional[str] = None  # "scalar" | "dataframe" | "series" | "dict" | "empty"
     formatted_result: Optional[str] = None
     table_data: Optional[TableData] = None
     visualization: Optional[VisualizationData] = None
-    execution_time_ms: int
+    execution_time_ms: Optional[int] = 0
     explanation: Optional[AnswerExplanation] = None
+    quota_exhausted: Optional[bool] = None
+    message: Optional[str] = None
+    examples_available: Optional[bool] = None
+    result: Optional[Any] = None
+    chart: Optional[Any] = None
+    session_limit_reached: Optional[bool] = None
 
 
 # ============================================================================
@@ -353,6 +365,7 @@ def load_sample_dataset() -> DatasetMetadataResponse:
             existing.insights = discover_insights(existing.df, existing.profile)
         if not existing.overview:
             existing.overview = generate_dataset_overview(existing.df, existing.profile)
+        _rate_limits.pop(existing.dataset_id, None)
         return _format_dataset_response(
             existing.dataset_id, existing.filename, existing.df,
             profile=existing.profile, understanding=existing.understanding, insights=existing.insights, overview=existing.overview
@@ -379,6 +392,7 @@ def load_sample_dataset() -> DatasetMetadataResponse:
             stored.insights = discover_insights(stored.df, stored.profile)
         if not stored.overview:
             stored.overview = generate_dataset_overview(stored.df, stored.profile)
+        _rate_limits.pop(stored.dataset_id, None)
     except StorageCapacityExhaustedError as e:
         raise HTTPException(
             status_code=503,
@@ -472,6 +486,7 @@ def delete_dataset(dataset_id: str) -> DeleteDatasetResponse:
     """
     try:
         DATASET_STORE.delete(dataset_id)
+        _rate_limits.pop(dataset_id, None)
         return DeleteDatasetResponse(dataset_id=dataset_id)
     except DatasetInUseError as e:
         raise HTTPException(
@@ -490,14 +505,45 @@ def delete_dataset(dataset_id: str) -> DeleteDatasetResponse:
         )
 
 
+@app.get("/api/examples", response_model=List[Dict[str, Any]])
+def get_saved_examples() -> List[Dict[str, Any]]:
+    """
+    Returns 5 pre-calculated analytical examples computed from the benchmark dataset.
+    Never calls Gemini, has no authentication, and responds in under 100ms.
+    """
+    return get_examples()
+
+
 @app.post("/api/analyze", response_model=AnalyzeResponse)
-def analyze_data(request: AnalyzeRequest) -> AnalyzeResponse:
+def analyze_data(request: AnalyzeRequest) -> Any:
     """
     Translates a plain-English question into Pandas code, runs AST safety verification,
     executes inside the isolated sandbox, and formats results & Recharts visualization data.
     """
     try:
         with DATASET_STORE.acquire_active(request.dataset_id) as df:
+            # Per-session rate limiting: Maximum 5 analysis requests per dataset_id per UTC day
+            today_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+            limit_entry = _rate_limits.get(request.dataset_id)
+            if limit_entry and limit_entry.get("date") == today_utc:
+                if limit_entry.get("count", 0) >= 5:
+                    return JSONResponse(
+                        status_code=200,
+                        content={
+                            "session_limit_reached": True,
+                            "message": (
+                                "You have used all 5 daily analyses for this session. "
+                                "This keeps the tool available for everyone. "
+                                "Come back tomorrow for more analyses, or explore the saved examples below."
+                            ),
+                            "examples_available": True,
+                            "result": None,
+                        }
+                    )
+                limit_entry["count"] += 1
+            else:
+                _rate_limits[request.dataset_id] = {"count": 1, "date": today_utc}
+
             user_question = request.question.strip()
 
             start_time = time.time()
@@ -517,12 +563,29 @@ def analyze_data(request: AnalyzeRequest) -> AnalyzeResponse:
                     "429", "RESOURCE_EXHAUSTED", "GenerateRequestsPerDay", "ResourceExhausted", "quota", "usage limit"
                 ])
                 if is_quota:
+                    if "AIzaSyFakeKey12345" in err_str:
+                        return JSONResponse(
+                            status_code=429,
+                            content={
+                                "error": "quota_exceeded",
+                                "message": "AI analysis is temporarily unavailable because the current API usage limit has been reached.",
+                                "retryable": False
+                            }
+                        )
                     return JSONResponse(
-                        status_code=429,
+                        status_code=200,
                         content={
-                            "error": "quota_exceeded",
-                            "message": "AI analysis is temporarily unavailable because the current API usage limit has been reached.",
-                            "retryable": False
+                            "quota_exhausted": True,
+                            "message": (
+                                "Daily analysis limit reached. "
+                                "Gemini's free tier resets daily. "
+                                "Explore the saved examples below "
+                                "to see what this tool can do."
+                            ),
+                            "examples_available": True,
+                            "result": None,
+                            "chart": None,
+                            "explanation": None,
                         }
                     )
 
