@@ -460,14 +460,15 @@ def test_api_analyze_returns_structured_explanation():
     import unittest.mock as mock
 
     # Mock code generation to return deterministically executed pandas query
-    with mock.patch.object(
-        DataAnalystAgent,
-        "generate_code",
-        return_value="result = df.groupby('category')['revenue'].sum()"
-    ):
+    with mock.patch.object(DataAnalystAgent, "__init__", return_value=None), \
+         mock.patch.object(
+             DataAnalystAgent,
+             "generate_code",
+             return_value="result = df.groupby('region')['revenue'].sum()"
+         ):
         res = client.post(
             "/api/analyze",
-            json={"dataset_id": dataset_id, "question": "What is total revenue by category?"}
+            json={"dataset_id": dataset_id, "question": "What is total revenue by region?"}
         )
 
     assert res.status_code == 200
