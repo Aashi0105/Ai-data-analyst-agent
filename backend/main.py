@@ -28,6 +28,8 @@ from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
+import json
+from pathlib import Path
 from utils import load_csv, get_dataset_summary, format_value
 from profiler import DatasetProfile, profile_dataset
 from understanding import DatasetUnderstanding, generate_dataset_understanding, generate_deterministic_fallback
@@ -36,6 +38,12 @@ from explanation import AnswerExplanation, explain_answer
 from overview import DatasetOverview, generate_dataset_overview
 from agent import DataAnalystAgent
 from backend.examples import get_examples
+try:
+    import backend.metrics as metrics_mod
+    from backend.metrics import log_event
+except ImportError:
+    import metrics as metrics_mod
+    from metrics import log_event
 
 logger = logging.getLogger(__name__)
 
@@ -265,6 +273,7 @@ def health_check() -> Dict[str, Any]:
 
 
 @app.post("/api/datasets/upload", response_model=DatasetMetadataResponse)
+@app.post("/api/datasets", response_model=DatasetMetadataResponse, include_in_schema=False)
 async def upload_dataset(request: Request, file: UploadFile = File(...)) -> DatasetMetadataResponse:
     """
     Ingests a user-uploaded CSV file, profiles the schema,
@@ -340,6 +349,16 @@ async def upload_dataset(request: Request, file: UploadFile = File(...)) -> Data
             pass
         raise HTTPException(status_code=500, detail=f"Failed to profile dataset: {str(e)}")
 
+    try:
+        log_event("dataset_uploaded", {
+            "dataset_id": dataset_id,
+            "row_count": int(len(df)),
+            "column_count": int(len(df.columns)),
+            "is_sample": False
+        })
+    except Exception:
+        pass
+
     return _format_dataset_response(
         dataset_id, file.filename, df,
         profile=profile, understanding=understanding, insights=insights, overview=overview
@@ -366,6 +385,15 @@ def load_sample_dataset() -> DatasetMetadataResponse:
         if not existing.overview:
             existing.overview = generate_dataset_overview(existing.df, existing.profile)
         _rate_limits.pop(existing.dataset_id, None)
+        try:
+            log_event("dataset_uploaded", {
+                "dataset_id": existing.dataset_id,
+                "row_count": int(len(existing.df)),
+                "column_count": int(len(existing.df.columns)),
+                "is_sample": True
+            })
+        except Exception:
+            pass
         return _format_dataset_response(
             existing.dataset_id, existing.filename, existing.df,
             profile=existing.profile, understanding=existing.understanding, insights=existing.insights, overview=existing.overview
@@ -393,6 +421,15 @@ def load_sample_dataset() -> DatasetMetadataResponse:
         if not stored.overview:
             stored.overview = generate_dataset_overview(stored.df, stored.profile)
         _rate_limits.pop(stored.dataset_id, None)
+        try:
+            log_event("dataset_uploaded", {
+                "dataset_id": stored.dataset_id,
+                "row_count": int(len(stored.df)),
+                "column_count": int(len(stored.df.columns)),
+                "is_sample": True
+            })
+        except Exception:
+            pass
     except StorageCapacityExhaustedError as e:
         raise HTTPException(
             status_code=503,
@@ -487,6 +524,12 @@ def delete_dataset(dataset_id: str) -> DeleteDatasetResponse:
     try:
         DATASET_STORE.delete(dataset_id)
         _rate_limits.pop(dataset_id, None)
+        try:
+            log_event("data_deleted", {
+                "dataset_id": dataset_id
+            })
+        except Exception:
+            pass
         return DeleteDatasetResponse(dataset_id=dataset_id)
     except DatasetInUseError as e:
         raise HTTPException(
@@ -511,7 +554,114 @@ def get_saved_examples() -> List[Dict[str, Any]]:
     Returns 5 pre-calculated analytical examples computed from the benchmark dataset.
     Never calls Gemini, has no authentication, and responds in under 100ms.
     """
+    try:
+        log_event("example_viewed", {
+            "source": "api_call"
+        })
+    except Exception:
+        pass
     return get_examples()
+
+
+@app.get("/api/metrics/summary")
+def get_metrics_summary() -> Dict[str, Any]:
+    """
+    Returns aggregated product metrics calculated from metrics_log.json.
+    Never raises an exception, never returns 4xx or 5xx; always returns HTTP 200.
+    """
+    default_summary = {
+        "total_uploads": 0,
+        "sample_loads": 0,
+        "total_questions": 0,
+        "total_successes": 0,
+        "total_failures": 0,
+        "success_rate_percent": 0.0,
+        "avg_time_to_result_seconds": 0.0,
+        "quota_hit_count": 0,
+        "examples_viewed_count": 0,
+        "data_deletions": 0,
+        "log_entries_total": 0,
+    }
+    try:
+        metrics_file = getattr(metrics_mod, "METRICS_FILE", Path("metrics_log.json"))
+        lock = getattr(metrics_mod, "_lock", None)
+
+        if not metrics_file.exists():
+            return default_summary
+
+        if lock:
+            with lock:
+                with open(metrics_file, "r", encoding="utf-8") as f:
+                    entries = json.load(f)
+        else:
+            with open(metrics_file, "r", encoding="utf-8") as f:
+                entries = json.load(f)
+
+        if not isinstance(entries, list) or not entries:
+            return default_summary
+
+        total_uploads = 0
+        sample_loads = 0
+        total_questions = 0
+        total_successes = 0
+        total_failures = 0
+        quota_hit_count = 0
+        examples_viewed_count = 0
+        data_deletions = 0
+        times = []
+
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            event = entry.get("event")
+            if event == "dataset_uploaded":
+                if entry.get("is_sample") is True:
+                    sample_loads += 1
+                else:
+                    total_uploads += 1
+            elif event == "question_asked":
+                total_questions += 1
+            elif event == "analysis_success":
+                total_successes += 1
+                t = entry.get("time_to_result_seconds")
+                if isinstance(t, (int, float)):
+                    times.append(float(t))
+            elif event == "analysis_failed":
+                total_failures += 1
+            elif event == "quota_exhausted":
+                quota_hit_count += 1
+            elif event == "example_viewed":
+                examples_viewed_count += 1
+            elif event == "data_deleted":
+                data_deletions += 1
+
+        total_attempts = total_successes + total_failures
+        denom = total_attempts if total_attempts > 0 else total_questions
+        if denom > 0:
+            success_rate = round((total_successes / denom) * 100.0, 1)
+        else:
+            success_rate = 0.0
+
+        if times:
+            avg_time = round(sum(times) / len(times), 2)
+        else:
+            avg_time = 0.0
+
+        return {
+            "total_uploads": total_uploads,
+            "sample_loads": sample_loads,
+            "total_questions": total_questions,
+            "total_successes": total_successes,
+            "total_failures": total_failures,
+            "success_rate_percent": success_rate,
+            "avg_time_to_result_seconds": avg_time,
+            "quota_hit_count": quota_hit_count,
+            "examples_viewed_count": examples_viewed_count,
+            "data_deletions": data_deletions,
+            "log_entries_total": len(entries),
+        }
+    except Exception:
+        return default_summary
 
 
 @app.post("/api/analyze", response_model=AnalyzeResponse)
@@ -520,6 +670,16 @@ def analyze_data(request: AnalyzeRequest) -> Any:
     Translates a plain-English question into Pandas code, runs AST safety verification,
     executes inside the isolated sandbox, and formats results & Recharts visualization data.
     """
+    start_time = time.time()
+    try:
+        log_event("question_asked", {
+            "dataset_id": request.dataset_id,
+            "question_length": len(request.question or ""),
+            "session_id": request.dataset_id
+        })
+    except Exception:
+        pass
+
     try:
         with DATASET_STORE.acquire_active(request.dataset_id) as df:
             # Per-session rate limiting: Maximum 5 analysis requests per dataset_id per UTC day
@@ -546,7 +706,6 @@ def analyze_data(request: AnalyzeRequest) -> Any:
 
             user_question = request.question.strip()
 
-            start_time = time.time()
             generated_code = ""
 
             # Stage 1: Generate Code using existing DataAnalystAgent
@@ -563,6 +722,12 @@ def analyze_data(request: AnalyzeRequest) -> Any:
                     "429", "RESOURCE_EXHAUSTED", "GenerateRequestsPerDay", "ResourceExhausted", "quota", "usage limit"
                 ])
                 if is_quota:
+                    try:
+                        log_event("quota_exhausted", {
+                            "session_id": request.dataset_id
+                        })
+                    except Exception:
+                        pass
                     if "AIzaSyFakeKey12345" in err_str:
                         return JSONResponse(
                             status_code=429,
@@ -589,6 +754,15 @@ def analyze_data(request: AnalyzeRequest) -> Any:
                         }
                     )
 
+                try:
+                    log_event("analysis_failed", {
+                        "dataset_id": request.dataset_id,
+                        "error_type": type(e).__name__,
+                        "session_id": request.dataset_id
+                    })
+                except Exception:
+                    pass
+
                 sanitized = _sanitize_error_message(err_str)
                 return AnalyzeResponse(
                     question=user_question,
@@ -604,6 +778,14 @@ def analyze_data(request: AnalyzeRequest) -> Any:
             is_valid, validation_msg = validate_code(cleaned_code)
             if not is_valid:
                 elapsed_ms = int((time.time() - start_time) * 1000)
+                try:
+                    log_event("analysis_failed", {
+                        "dataset_id": request.dataset_id,
+                        "error_type": "SecurityValidationError",
+                        "session_id": request.dataset_id
+                    })
+                except Exception:
+                    pass
                 return AnalyzeResponse(
                     question=user_question,
                     code=cleaned_code,
@@ -619,6 +801,14 @@ def analyze_data(request: AnalyzeRequest) -> Any:
             elapsed_ms = int((time.time() - start_time) * 1000)
 
             if not exec_success:
+                try:
+                    log_event("analysis_failed", {
+                        "dataset_id": request.dataset_id,
+                        "error_type": "SandboxExecutionError",
+                        "session_id": request.dataset_id
+                    })
+                except Exception:
+                    pass
                 return AnalyzeResponse(
                     question=user_question,
                     code=cleaned_code,
@@ -696,6 +886,17 @@ def analyze_data(request: AnalyzeRequest) -> Any:
             except Exception as exp_err:
                 logger.warning("Explanation generation failed gracefully: %s", exp_err)
 
+            elapsed_seconds = float(time.time() - start_time)
+            try:
+                log_event("analysis_success", {
+                    "dataset_id": request.dataset_id,
+                    "time_to_result_seconds": elapsed_seconds,
+                    "had_chart": bool(viz_data is not None),
+                    "session_id": request.dataset_id
+                })
+            except Exception:
+                pass
+
             return AnalyzeResponse(
                 question=user_question,
                 code=cleaned_code,
@@ -710,12 +911,28 @@ def analyze_data(request: AnalyzeRequest) -> Any:
                 explanation=explanation_obj
             )
 
-    except DatasetSessionExpiredError:
+    except DatasetSessionExpiredError as e:
+        try:
+            log_event("analysis_failed", {
+                "dataset_id": request.dataset_id,
+                "error_type": type(e).__name__,
+                "session_id": request.dataset_id
+            })
+        except Exception:
+            pass
         raise HTTPException(
             status_code=404,
             detail="Dataset session expired. Please re-upload your CSV."
         )
-    except DatasetNotFoundError:
+    except DatasetNotFoundError as e:
+        try:
+            log_event("analysis_failed", {
+                "dataset_id": request.dataset_id,
+                "error_type": type(e).__name__,
+                "session_id": request.dataset_id
+            })
+        except Exception:
+            pass
         raise HTTPException(
             status_code=404,
             detail=f"Dataset '{request.dataset_id}' not found. Please upload a CSV first."

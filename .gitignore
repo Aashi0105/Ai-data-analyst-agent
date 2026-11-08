@@ -79,3 +79,7 @@ yarn-error.log*
 *.parquet
 *.sqlite3
 *.db
+
+# Product metrics log (contains usage data)
+metrics_log.json
+
