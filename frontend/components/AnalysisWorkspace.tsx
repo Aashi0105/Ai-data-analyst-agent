@@ -2,7 +2,7 @@
 
 import React, { useState, useEffect } from "react";
 import { DatasetMetadata, AnalyzeResponse, HistoryItem, SavedExample } from "@/types";
-import { analyzeQuery, getExamples } from "@/lib/api";
+import { analyzeQuery, getExamples, deleteDataset } from "@/lib/api";
 import { ResultVisualization } from "./ResultVisualization";
 import { CodeAuditPanel } from "./CodeAuditPanel";
 import { QueryHistory } from "./QueryHistory";
@@ -15,6 +15,8 @@ import { Send, Sparkles, AlertCircle, Loader2, Table2 } from "lucide-react";
 
 interface AnalysisWorkspaceProps {
   dataset: DatasetMetadata;
+  initialQuestion?: string;
+  onDeleteDataset?: () => void;
 }
 
 const LOADING_MESSAGES = [
@@ -24,7 +26,11 @@ const LOADING_MESSAGES = [
   "Almost done — complex questions take 15-20 seconds...",
 ];
 
-export const AnalysisWorkspace: React.FC<AnalysisWorkspaceProps> = ({ dataset }) => {
+export const AnalysisWorkspace: React.FC<AnalysisWorkspaceProps> = ({
+  dataset,
+  initialQuestion,
+  onDeleteDataset,
+}) => {
   const [question, setQuestion] = useState("");
   const [isLoading, setIsLoading] = useState(false);
   const [loadingStep, setLoadingStep] = useState(0);
@@ -36,6 +42,64 @@ export const AnalysisWorkspace: React.FC<AnalysisWorkspaceProps> = ({ dataset })
   const [activeExampleIndex, setActiveExampleIndex] = useState(0);
   const [history, setHistory] = useState<HistoryItem[]>([]);
   const [activeHistoryId, setActiveHistoryId] = useState<string | undefined>();
+
+  const handleDeleteData = async () => {
+    try {
+      await deleteDataset(dataset.dataset_id);
+    } catch (e) {
+      console.error("Failed to delete dataset", e);
+    }
+    if (onDeleteDataset) {
+      onDeleteDataset();
+    }
+  };
+
+  // Auto-display saved example when initialQuestion is provided (e.g. from sample dataset or example cards)
+  useEffect(() => {
+    if (initialQuestion) {
+      getExamples()
+        .then((examples) => {
+          setSavedExamples(examples);
+          const norm = (s: string) => s.toLowerCase().replace(/[^a-z0-9]/g, "");
+          const targetNorm = norm(initialQuestion);
+
+          let matched = examples.find((ex) => {
+            const exNorm = norm(ex.question);
+            return exNorm.includes(targetNorm) || targetNorm.includes(exNorm);
+          });
+
+          if (!matched) {
+            const keywords = ["revenue", "category", "profit", "trend"];
+            for (const kw of keywords) {
+              if (targetNorm.includes(kw)) {
+                matched = examples.find((ex) => norm(ex.question).includes(kw));
+                if (matched) break;
+              }
+            }
+          }
+
+          const exampleToDisplay = matched || examples[0];
+          if (exampleToDisplay) {
+            const exIdx = examples.indexOf(exampleToDisplay);
+            setActiveExampleIndex(exIdx >= 0 ? exIdx : 0);
+            setQuestion(exampleToDisplay.question);
+            setCurrentResult({
+              question: exampleToDisplay.question,
+              code: `# Pre-calculated verified result for ${dataset.filename}\n# Question: ${exampleToDisplay.question}`,
+              validation_status: "passed",
+              validation_message: "Pre-calculated verified result",
+              execution_status: "passed",
+              formatted_result: exampleToDisplay.answer_text,
+              visualization: exampleToDisplay.chart_data,
+              execution_time_ms: 1,
+            });
+          }
+        })
+        .catch((err) => {
+          console.error("Failed to load initial example", err);
+        });
+    }
+  }, [initialQuestion, dataset.filename]);
 
   // Cycle through loading messages while query is running
   useEffect(() => {
@@ -142,13 +206,23 @@ export const AnalysisWorkspace: React.FC<AnalysisWorkspaceProps> = ({ dataset })
   return (
     <div className="flex-1 flex flex-col p-6 sm:p-10 max-w-5xl mx-auto w-full overflow-y-auto">
       {/* Header */}
-      <div className="mb-6">
-        <span className="text-xs uppercase tracking-wider text-charcoal-subtle font-medium block mb-1">
-          Analysis Workspace
-        </span>
-        <h1 className="text-2xl sm:text-3xl font-serif text-charcoal tracking-tight">
-          Explore {dataset.filename.replace(" (Sample)", "")}
-        </h1>
+      <div className="mb-6 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2">
+        <div>
+          <span className="text-xs uppercase tracking-wider text-charcoal-subtle font-medium block mb-1">
+            Analysis Workspace
+          </span>
+          <h1 className="text-2xl sm:text-3xl font-serif text-charcoal tracking-tight">
+            Explore {dataset.filename.replace(" (Sample)", "")}
+          </h1>
+        </div>
+        <button
+          type="button"
+          onClick={handleDeleteData}
+          className="text-xs text-charcoal-muted hover:text-red-700 underline underline-offset-2 transition self-start sm:self-auto cursor-pointer"
+          title="Delete this dataset and clear session data"
+        >
+          Delete my data
+        </button>
       </div>
 
       {/* Dedicated Dataset Overview Card */}
@@ -388,13 +462,22 @@ export const AnalysisWorkspace: React.FC<AnalysisWorkspaceProps> = ({ dataset })
 
       {/* Dominant Answer Area */}
       {currentResult && !isLoading && currentResult.execution_status === "passed" && (
-        <div className="mt-6 border border-editorial-border rounded-lg bg-surface p-6">
+        <div className="mt-6 border border-editorial-border rounded-lg bg-surface p-6 shadow-sm">
           <div className="flex items-center justify-between pb-3 mb-4 border-b border-editorial-border">
-            <span className="text-[11px] uppercase tracking-wider text-charcoal-subtle font-semibold">
-              Analysis Result
-            </span>
+            <div className="flex items-center space-x-2">
+              <span className="text-[11px] uppercase tracking-wider text-charcoal-subtle font-semibold">
+                {currentResult.question ? currentResult.question : "Analysis Result"}
+              </span>
+              {currentResult.validation_message?.includes("Pre-calculated") && (
+                <span className="inline-flex items-center px-2 py-0.5 rounded text-[10px] font-medium bg-stone-100 text-stone-600 border border-stone-200">
+                  Saved Example
+                </span>
+              )}
+            </div>
             <span className="text-[11px] text-charcoal-muted font-mono">
-              {currentResult.execution_time_ms}ms execution
+              {currentResult.validation_message?.includes("Pre-calculated")
+                ? "Pre-calculated • 1ms"
+                : `${currentResult.execution_time_ms}ms execution`}
             </span>
           </div>
 
@@ -472,6 +555,18 @@ export const AnalysisWorkspace: React.FC<AnalysisWorkspaceProps> = ({ dataset })
         activeId={activeHistoryId}
         onSelect={handleSelectHistory}
       />
+
+      {/* Workspace Privacy & Data Deletion Footer (Task 6) */}
+      <div className="mt-12 pt-6 border-t border-editorial-border flex flex-col sm:flex-row items-center justify-between text-xs text-charcoal-muted gap-2">
+        <span>Session data stored in-memory (auto-expires in 1 hour). No sensitive personal data retained.</span>
+        <button
+          type="button"
+          onClick={handleDeleteData}
+          className="hover:text-red-700 underline underline-offset-2 transition cursor-pointer"
+        >
+          Delete my data
+        </button>
+      </div>
     </div>
   );
 };

@@ -1,7 +1,7 @@
 "use client";
 
 import React, { useRef, useState } from "react";
-import { UploadCloud, FileText, Sparkles, AlertCircle } from "lucide-react";
+import { UploadCloud, Sparkles, AlertCircle } from "lucide-react";
 import { uploadDataset, loadSampleDataset } from "@/lib/api";
 import { DatasetMetadata } from "@/types";
 
@@ -9,7 +9,7 @@ const MAX_FILE_SIZE_MB = 25;
 const MAX_FILE_SIZE_BYTES = MAX_FILE_SIZE_MB * 1024 * 1024; // 25 MiB
 
 interface LandingUploadProps {
-  onDatasetLoaded: (dataset: DatasetMetadata) => void;
+  onDatasetLoaded: (dataset: DatasetMetadata, initialQuestion?: string) => void;
 }
 
 export const LandingUpload: React.FC<LandingUploadProps> = ({ onDatasetLoaded }) => {
@@ -48,12 +48,12 @@ export const LandingUpload: React.FC<LandingUploadProps> = ({ onDatasetLoaded })
     }
   };
 
-  const handleSampleClick = async () => {
+  const handleSampleClick = async (questionToDisplay?: string) => {
     setErrorMessage(null);
     setIsLoading(true);
     try {
       const metadata = await loadSampleDataset();
-      onDatasetLoaded(metadata);
+      onDatasetLoaded(metadata, questionToDisplay || "Which region has the highest total revenue?");
     } catch (err: any) {
       setErrorMessage(err.message || "Failed to load sample dataset from backend.");
     } finally {
@@ -81,17 +81,22 @@ export const LandingUpload: React.FC<LandingUploadProps> = ({ onDatasetLoaded })
   return (
     <main className="flex-1 flex flex-col items-center justify-center px-6 py-16 max-w-3xl mx-auto w-full">
       {/* Editorial Headline */}
-      <div className="text-center mb-10">
+      <div className="text-center mb-8">
         <span className="text-xs uppercase tracking-widest text-editorial-accent font-medium mb-3 block">
           AI-Powered Data Exploration
         </span>
         <h1 className="text-4xl sm:text-5xl font-serif text-charcoal font-normal tracking-tight mb-4">
-          Ask your data anything.
+          Ask questions about your data. Get answers instantly.
         </h1>
-        <p className="text-charcoal-muted text-base max-w-md mx-auto font-light leading-relaxed">
-          Upload a CSV and explore it using natural language.
+        <p className="text-charcoal-muted text-base max-w-xl mx-auto font-light leading-relaxed">
+          Upload a CSV and ask anything in plain English — the agent writes the code, runs it safely, and explains what it found. No Python needed.
         </p>
       </div>
+
+      {/* Privacy Notice (Task 6) */}
+      <p className="text-xs text-charcoal-muted max-w-xl text-center mb-3 font-light leading-relaxed">
+        Your data is processed securely: only column names, data types, and 3 sample rows are sent to Google Gemini for analysis. Data is held in memory for up to 1 hour, then automatically deleted. Do not upload files containing sensitive personal information.
+      </p>
 
       {/* Central Upload Area */}
       <div
@@ -140,6 +145,29 @@ export const LandingUpload: React.FC<LandingUploadProps> = ({ onDatasetLoaded })
         </div>
       </div>
 
+      {/* Action Buttons: Primary Upload & Secondary Sample Dataset CTA (Task 3) */}
+      <div className="mt-6 flex flex-col sm:flex-row items-center justify-center gap-3.5 w-full">
+        <button
+          type="button"
+          onClick={() => fileInputRef.current?.click()}
+          disabled={isLoading}
+          className="w-full sm:w-auto px-6 py-3 bg-editorial-accent hover:bg-[#153427] text-white text-xs sm:text-sm font-medium tracking-wide uppercase rounded shadow-sm transition flex items-center justify-center space-x-2 disabled:opacity-50 shrink-0 cursor-pointer"
+        >
+          <UploadCloud className="w-4 h-4" />
+          <span>Upload your CSV</span>
+        </button>
+
+        <button
+          type="button"
+          onClick={() => handleSampleClick("Which region has the highest total revenue?")}
+          disabled={isLoading}
+          className="w-full sm:w-auto px-6 py-3 bg-surface hover:bg-stone-100 text-editorial-accent border-2 border-editorial-accent text-xs sm:text-sm font-medium tracking-wide rounded shadow-sm transition flex items-center justify-center space-x-2 disabled:opacity-50 shrink-0 cursor-pointer"
+        >
+          <Sparkles className="w-4 h-4 text-editorial-accent" />
+          <span>Try with a sample dataset →</span>
+        </button>
+      </div>
+
       {/* Error Message */}
       {errorMessage && (
         <div className="mt-4 w-full p-3 rounded border border-red-200 bg-red-50 text-xs text-red-700 flex items-center space-x-2">
@@ -148,38 +176,45 @@ export const LandingUpload: React.FC<LandingUploadProps> = ({ onDatasetLoaded })
         </div>
       )}
 
-      {/* One-click Sample Dataset */}
-      <div className="mt-6 flex items-center space-x-2 text-xs text-charcoal-muted">
-        <span>Need data to test?</span>
-        <button
-          onClick={handleSampleClick}
-          disabled={isLoading}
-          className="font-medium text-editorial-accent hover:underline flex items-center space-x-1"
-        >
-          <Sparkles className="w-3 h-3" />
-          <span>Try with sample e-commerce data (100 rows)</span>
-        </button>
+      {/* Who It's For Section (Task 5) */}
+      <div className="mt-8 text-center">
+        <p className="text-xs font-medium text-charcoal-subtle uppercase tracking-wider mb-2">
+          Built for people who work with data but not code:
+        </p>
+        <div className="flex flex-col sm:flex-row items-center justify-center gap-2 sm:gap-6 text-xs text-charcoal-muted">
+          <span>• HR managers analyzing workforce trends</span>
+          <span>• Operations teams tracking performance</span>
+          <span>• Anyone who wants answers from spreadsheets</span>
+        </div>
       </div>
 
-      {/* Sample Query Prompts */}
-      <div className="mt-14 w-full pt-8 border-t border-editorial-border">
+      {/* Sample Query Prompts - Clickable Question Cards (Task 4) */}
+      <div className="mt-10 w-full pt-6 border-t border-editorial-border">
         <p className="text-xs uppercase tracking-wider text-charcoal-subtle font-medium text-center mb-4">
           Example questions you can ask
         </p>
         <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
           {[
-            "Which region generated the most revenue?",
-            "What are my top 5 products?",
-            "How did revenue change over time?",
+            "Which region has the highest revenue?",
+            "What is the top-selling product category?",
+            "Which product has the highest profit?",
           ].map((prompt, idx) => (
-            <div
+            <button
               key={idx}
-              className="p-3.5 rounded border border-editorial-border bg-surface/80 text-xs text-charcoal font-normal text-left"
+              type="button"
+              onClick={() => handleSampleClick(prompt)}
+              disabled={isLoading}
+              className="p-3.5 rounded border border-editorial-border bg-surface/90 hover:bg-editorial-hover hover:border-editorial-accent text-xs text-charcoal font-normal text-left cursor-pointer transition-all shadow-sm hover:shadow flex items-start justify-between group disabled:opacity-50"
             >
-              <span className="text-charcoal-subtle font-serif italic mr-1.5">“</span>
-              {prompt}
-              <span className="text-charcoal-subtle font-serif italic ml-1.5">”</span>
-            </div>
+              <span>
+                <span className="text-charcoal-subtle font-serif italic mr-1.5">“</span>
+                {prompt}
+                <span className="text-charcoal-subtle font-serif italic ml-1.5">”</span>
+              </span>
+              <span className="text-editorial-accent opacity-0 group-hover:opacity-100 transition-opacity ml-1.5 font-bold text-xs shrink-0">
+                →
+              </span>
+            </button>
           ))}
         </div>
       </div>

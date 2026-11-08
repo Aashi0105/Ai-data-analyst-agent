@@ -11,6 +11,7 @@ import { DatasetInspector } from "@/components/DatasetInspector";
 
 export default function Home() {
   const [dataset, setDataset] = useState<DatasetMetadata | null>(null);
+  const [initialQuestion, setInitialQuestion] = useState<string | undefined>();
   const [isInspectorOpen, setIsInspectorOpen] = useState(false);
   const [isResetting, setIsResetting] = useState(false);
 
@@ -19,6 +20,7 @@ export default function Home() {
     const currentId = dataset?.dataset_id;
     setIsResetting(true);
     setDataset(null);
+    setInitialQuestion(undefined);
     setIsInspectorOpen(false);
 
     if (currentId) {
@@ -45,7 +47,12 @@ export default function Home() {
 
       {/* Main Screen Layout */}
       {!dataset ? (
-        <LandingUpload onDatasetLoaded={(meta) => setDataset(meta)} />
+        <LandingUpload
+          onDatasetLoaded={(meta, question) => {
+            setDataset(meta);
+            setInitialQuestion(question);
+          }}
+        />
       ) : (
         <div className="flex-1 flex flex-col lg:flex-row overflow-hidden">
           {/* Left Dataset Sidebar */}
@@ -55,7 +62,11 @@ export default function Home() {
           />
 
           {/* Main Analysis Workspace */}
-          <AnalysisWorkspace dataset={dataset} />
+          <AnalysisWorkspace
+            dataset={dataset}
+            initialQuestion={initialQuestion}
+            onDeleteDataset={handleReset}
+          />
         </div>
       )}
 
